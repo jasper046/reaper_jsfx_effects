@@ -1,0 +1,567 @@
+desc: Spectral Dynamics Analyzer
+tags: analysis spectrum dynamics mastering mid-side
+author: Jasper Schrader
+
+in_pin: left input
+in_pin: right input
+out_pin: none
+
+// Settings are controlled via the gfx menu — no sliders needed.
+// State (FFT size, display options, reference snapshot) persists via @serialize.
+
+options:no_meter
+
+@init
+
+// ── constants ──────────────────────────────────────────────────────────────
+MAX_BINS    = 1024;
+SMALL_MAG   = 0.000000000000000000000000000001;
+BIG_MAG     = 1000000000000000000000000000000;
+LOG2        = log(2);
+MIN_FREQ    = 10;
+MAX_FREQ    = 22050;
+FREQ_LOGMAX = log(MAX_FREQ / MIN_FREQ);
+TILT_PIVOT  = log(1000) / LOG2;
+
+// ── memory layout ──────────────────────────────────────────────────────────
+mem = 0;
+function alloc(n) local(i) ( i = mem; mem += n; i; );
+
+fftwork  = alloc(32768);
+win_buf  = alloc(16384);
+bin_freq = alloc(MAX_BINS);
+
+mid_peak = alloc(MAX_BINS);
+mid_avg  = alloc(MAX_BINS);
+mid_min  = alloc(MAX_BINS);
+sid_peak = alloc(MAX_BINS);
+sid_avg  = alloc(MAX_BINS);
+sid_min  = alloc(MAX_BINS);
+
+// reference snapshot (stored as tilted dB values)
+ref_freq  = alloc(MAX_BINS);
+ref_mpeak = alloc(MAX_BINS);
+ref_mavg  = alloc(MAX_BINS);
+ref_mmin  = alloc(MAX_BINS);
+ref_speak = alloc(MAX_BINS);
+ref_savg  = alloc(MAX_BINS);
+ref_smin  = alloc(MAX_BINS);
+
+MAX_HIST = 49151;   // 32768 + 16383
+mid_hist = alloc(MAX_HIST);
+sid_hist = alloc(MAX_HIST);
+
+// ── settings (persist via @serialize) ─────────────────────────────────────
+// Defaults — overwritten by @serialize on load
+fft_size_idx = 2;   // 0=2048 1=4096 2=8192 3=16384
+avg_time_idx = 1;   // 0=150ms 1=400ms 2=1200ms 3=3000ms
+peak_dec_idx = 1;   // 0=Fast 1=Medium 2=Slow
+tilt_idx     = 2;   // 0=0 1=1.5 2=3 3=4.5 4=6 dB/oct
+ceiling_idx  = 0;   // 0=0dB 1=+20dB 2=+40dB
+floor_idx    = 1;   // 0=-60dB 1=-90dB 2=-120dB
+ref_loaded   = 0;
+ref_num_bins = 0;
+
+// ── derived values ─────────────────────────────────────────────────────────
+fft_size   = 8192;
+win_built  = 0;
+num_bins   = 0;
+avg_coef   = 0;
+peak_coef  = 0;
+tilt_val   = 3;
+ceiling_db = 0;
+floor_db   = -90;
+
+mid_pos = mid_hist; mid_end = mid_hist + fft_size + (fft_size * 0.5 - 1);
+sid_pos = sid_hist; sid_end = sid_hist + fft_size + (fft_size * 0.5 - 1);
+
+memset(mid_peak, SMALL_MAG, MAX_BINS);
+memset(mid_avg,  SMALL_MAG, MAX_BINS);
+memset(mid_min,  BIG_MAG,   MAX_BINS);
+memset(sid_peak, SMALL_MAG, MAX_BINS);
+memset(sid_avg,  SMALL_MAG, MAX_BINS);
+memset(sid_min,  BIG_MAG,   MAX_BINS);
+
+// ── button edge state ──────────────────────────────────────────────────────
+btn_snap_dn  = 0;
+btn_clear_dn = 0;
+btn_reset_dn = 0;
+btn_menu_dn  = 0;
+
+// ── helpers ────────────────────────────────────────────────────────────────
+function mag_to_db(m) ( 10 * log10(max(m, SMALL_MAG)); );
+
+function tilt_db(db, freq) (
+  tilt_val != 0 ? db + tilt_val * (log(max(freq, 1)) / LOG2 - TILT_PIVOT) : db;
+);
+
+function freq_to_x(freq) (
+  left_margin + plot_w * log(freq / MIN_FREQ) / FREQ_LOGMAX;
+);
+
+function db_to_y(db, top, bot) (
+  top + (db - ceiling_db) / (floor_db - ceiling_db) * (bot - top);
+);
+
+// ── apply derived values from indices ─────────────────────────────────────
+function apply_settings() local(new_fft, hist_sz, frames) (
+  new_fft = (2 ^ (fft_size_idx + 1)) * 1024;
+  new_fft != fft_size ? (
+    fft_size  = new_fft;
+    win_built = 0;
+    hist_sz   = fft_size + (fft_size * 0.5 - 1);
+    mid_end   = mid_hist + hist_sz;
+    sid_end   = sid_hist + hist_sz;
+    memset(mid_hist, 0, MAX_HIST);
+    memset(sid_hist, 0, MAX_HIST);
+    mid_pos   = mid_hist;
+    sid_pos   = sid_hist;
+    memset(mid_peak, SMALL_MAG, MAX_BINS);
+    memset(mid_avg,  SMALL_MAG, MAX_BINS);
+    memset(mid_min,  BIG_MAG,   MAX_BINS);
+    memset(sid_peak, SMALL_MAG, MAX_BINS);
+    memset(sid_avg,  SMALL_MAG, MAX_BINS);
+    memset(sid_min,  BIG_MAG,   MAX_BINS);
+    num_bins = 0;
+  );
+
+  frames = max(1, srate / fft_size);
+
+  avg_coef = avg_time_idx == 0 ? exp(-1 / (0.150 * frames)) :
+             avg_time_idx == 1 ? exp(-1 / (0.400 * frames)) :
+             avg_time_idx == 2 ? exp(-1 / (1.200 * frames)) :
+                                 exp(-1 / (3.000 * frames));
+
+  peak_coef = peak_dec_idx == 0 ? exp(-1 / (0.100 * frames)) :
+              peak_dec_idx == 1 ? exp(-1 / (0.500 * frames)) :
+                                  exp(-1 / (2.000 * frames));
+
+  tilt_val   = tilt_idx == 0 ? 0 : tilt_idx == 1 ? 1.5 : tilt_idx == 2 ? 3 :
+               tilt_idx == 3 ? 4.5 : 6;
+
+  ceiling_db = ceiling_idx == 0 ? 0 : ceiling_idx == 1 ? 20 : 40;
+  floor_db   = floor_idx   == 0 ? -60 : floor_idx == 1 ? -90 : -120;
+);
+
+apply_settings();
+
+// ── snapshot: copy live envelopes into reference arrays ───────────────────
+function take_snapshot() local(i, freq) (
+  i = 1;
+  loop(num_bins,
+    freq = bin_freq[i];
+    ref_freq[i-1]  = freq;
+    ref_mpeak[i-1] = tilt_db(mag_to_db(mid_peak[i]), freq);
+    ref_mavg[i-1]  = tilt_db(mag_to_db(mid_avg[i]),  freq);
+    ref_mmin[i-1]  = tilt_db(mag_to_db(mid_min[i]),  freq);
+    ref_speak[i-1] = tilt_db(mag_to_db(sid_peak[i]), freq);
+    ref_savg[i-1]  = tilt_db(mag_to_db(sid_avg[i]),  freq);
+    ref_smin[i-1]  = tilt_db(mag_to_db(sid_min[i]),  freq);
+    i += 1;
+  );
+  ref_num_bins = num_bins;
+  ref_loaded   = 1;
+);
+
+// ── window builder ─────────────────────────────────────────────────────────
+function build_window() local(i, dp, wp, pwr) (
+  dp = $pi * 2 / fft_size;
+  i = 0; pwr = 0;
+  loop(fft_size * 0.5 + 1,
+    wp = i * dp;
+    pwr += (win_buf[i] = 0.35875 - 0.48829*cos(wp) + 0.14128*cos(2*wp) - 0.01168*cos(3*wp));
+    i += 1;
+  );
+  pwr = 0.5 / (pwr * 2 - win_buf[i - 1]);
+  loop(fft_size * 0.5 + 1, win_buf[i -= 1] *= pwr);
+  win_built = fft_size;
+);
+
+// ── FFT + per-bin envelope update ─────────────────────────────────────────
+function run_fft(hist, hpos, hend, peak_buf, avg_buf, min_buf, write_freq)
+  local(b1, b2, b3, i, mag, freq, bin, last_bin, nb, rof)
+(
+  b1 = hpos - fft_size;
+  b1 < hist ? b1 += hend - hist;
+  b2 = win_buf;
+  b3 = fftwork;
+  loop(fft_size * 0.5 + 1,
+    b3[] = b1[] * b2[];
+    b3 += 1; b2 += 1;
+    (b1 += 1) >= hend ? b1 = hist;
+  );
+  b2 -= 1;
+  loop(fft_size * 0.5 - 1,
+    b3[] = b1[] * (b2 -= 1)[];
+    b3 += 1;
+    (b1 += 1) >= hend ? b1 = hist;
+  );
+
+  fft_real(fftwork, fft_size);
+  fft_permute(fftwork, fft_size / 2);
+  fftwork[1] = 0;
+
+  rof      = srate / fft_size;
+  last_bin = -1;
+  nb       = 0;
+  i        = 1;
+
+  loop(fft_size * 0.5,
+    freq = i * rof;
+    bin  = floor(32 * log(freq) / LOG2);
+    mag  = sqr(fftwork[i*2]) + sqr(fftwork[i*2+1]);
+
+    bin != last_bin ? (
+      nb += 1;
+      last_bin = bin;
+      peak_buf[nb] = max(mag, peak_buf[nb] * peak_coef);
+      avg_buf[nb]  = avg_coef * avg_buf[nb] + (1 - avg_coef) * mag;
+      min_buf[nb]  = min(mag, min_buf[nb]);
+      write_freq ? bin_freq[nb] = freq;
+    ) : (
+      // accumulate within bin before envelope step
+      peak_buf[nb] = max(peak_buf[nb], mag);
+      min_buf[nb]  = min(min_buf[nb],  mag);
+    );
+    i += 1;
+  );
+  nb;
+);
+
+@serialize
+// Persist settings and reference snapshot across sessions/presets
+file_var(0, fft_size_idx);
+file_var(0, avg_time_idx);
+file_var(0, peak_dec_idx);
+file_var(0, tilt_idx);
+file_var(0, ceiling_idx);
+file_var(0, floor_idx);
+file_var(0, ref_loaded);
+file_var(0, ref_num_bins);
+file_mem(0, ref_freq,  ref_num_bins);
+file_mem(0, ref_mpeak, ref_num_bins);
+file_mem(0, ref_mavg,  ref_num_bins);
+file_mem(0, ref_mmin,  ref_num_bins);
+file_mem(0, ref_speak, ref_num_bins);
+file_mem(0, ref_savg,  ref_num_bins);
+file_mem(0, ref_smin,  ref_num_bins);
+apply_settings();
+
+@sample
+
+mid_pos[] = (spl0 + spl1) * 0.5;
+mid_pos += 1;
+mid_pos >= mid_end ? mid_pos = mid_hist;
+
+sid_pos[] = (spl0 - spl1) * 0.5;
+sid_pos += 1;
+sid_pos >= sid_end ? sid_pos = sid_hist;
+
+@gfx 800 500
+
+// ── font / retina ─────────────────────────────────────────────────────────
+gfx_ext_retina == 2 ? (
+  gfx_setfont(1, "Arial", 22, 'b');
+  gfx_setfont(2, "Arial", 16);
+) : (
+  gfx_setfont(1, "Arial", 12, 'b');
+  gfx_setfont(2, "Arial", 10);
+);
+gfx_setfont(2);
+
+// ── layout ────────────────────────────────────────────────────────────────
+left_margin  = gfx_texth * 3;
+right_margin = 4;
+top_margin   = gfx_texth + 8;
+bot_margin   = gfx_texth + 12;
+mid_divider  = floor((gfx_h - top_margin - bot_margin) * 0.5) + top_margin;
+plot_w       = gfx_w - left_margin - right_margin;
+
+mid_top = top_margin;
+mid_bot = mid_divider - 2;
+sid_top = mid_divider + 2;
+sid_bot = gfx_h - bot_margin;
+
+// ── FFT ───────────────────────────────────────────────────────────────────
+win_built != fft_size ? build_window();
+num_bins = run_fft(mid_hist, mid_pos, mid_end, mid_peak, mid_avg, mid_min, 1);
+           run_fft(sid_hist, sid_pos, sid_end, sid_peak, sid_avg, sid_min, 0);
+
+// ── clear background ──────────────────────────────────────────────────────
+gfx_r = 0.07; gfx_g = 0.07; gfx_b = 0.09; gfx_a = 1;
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+// ── grids ─────────────────────────────────────────────────────────────────
+function draw_db_grid(top, bot) local(db, y) (
+  db = ceiling_db;
+  while(
+    y = db_to_y(db, top, bot);
+    y >= top && y <= bot ? (
+      gfx_r = gfx_g = gfx_b = 1; gfx_a = 0.10;
+      gfx_line(left_margin, y, gfx_w - right_margin, y, 0);
+      gfx_r = gfx_g = gfx_b = 0.40; gfx_a = 1;
+      gfx_x = 1; gfx_y = y - gfx_texth * 0.5;
+      gfx_drawnumber(db, 0);
+    );
+    db -= 10;
+    db >= floor_db;
+  );
+);
+
+function draw_freq_grid() local(f, x, lx, fw, fh, label) (
+  f = 10; lx = 0;
+  while(
+    (f==20||f==50||f==100||f==200||f==500||f==1000||f==2000||f==5000||f==10000) ? (
+      x = freq_to_x(f);
+      x > lx ? (
+        gfx_r = gfx_g = gfx_b = 1; gfx_a = 0.15;
+        gfx_line(x, mid_top, x, sid_bot, 0);
+        gfx_r = gfx_g = gfx_b = 0.45; gfx_a = 1;
+        label = #;
+        f >= 1000 ? sprintf(label, "%dk", f/1000) : sprintf(label, "%d", f);
+        gfx_measurestr(label, fw, fh);
+        gfx_x = x - fw * 0.5;
+        gfx_y = gfx_h - bot_margin + 3;
+        gfx_drawstr(label);
+        lx = x + 4;
+      );
+    );
+    f += (f < 100 ? 10 : f < 1000 ? 100 : f < 10000 ? 1000 : 10000);
+    f < MAX_FREQ;
+  );
+);
+
+draw_db_grid(mid_top, mid_bot);
+draw_db_grid(sid_top, sid_bot);
+draw_freq_grid();
+
+gfx_r = gfx_g = gfx_b = 0.28; gfx_a = 1;
+gfx_line(0, mid_divider, gfx_w, mid_divider, 0);
+
+// ── spectrum drawing helpers ───────────────────────────────────────────────
+function draw_mag_line(mbuf, top, bot) local(i, freq, db, x, y, lx, ly) (
+  lx = -1; i = 1;
+  loop(num_bins,
+    freq = bin_freq[i];
+    db   = tilt_db(mag_to_db(mbuf[i]), freq);
+    x = freq_to_x(freq);
+    y = max(top, min(bot, db_to_y(db, top, bot)));
+    lx >= 0 ? gfx_line(lx, ly, x, y, 1);
+    lx = x; ly = y; i += 1;
+  );
+);
+
+function draw_mag_fill(tbuf, bbuf, top, bot) local(i, freq, x, yt, yb, lx, lyt, lyb) (
+  lx = -1; i = 1;
+  loop(num_bins,
+    freq = bin_freq[i];
+    yt = max(top, min(bot, db_to_y(tilt_db(mag_to_db(tbuf[i]), freq), top, bot)));
+    yb = max(top, min(bot, db_to_y(tilt_db(mag_to_db(bbuf[i]), freq), top, bot)));
+    x  = freq_to_x(freq);
+    lx >= 0 ? gfx_triangle(lx, lyb, lx, lyt, x, yt, x, yb);
+    lx = x; lyt = yt; lyb = yb; i += 1;
+  );
+);
+
+function draw_ref_line(db_arr, top, bot) local(i, x, y, lx, ly) (
+  lx = -1; i = 0;
+  loop(ref_num_bins,
+    x = freq_to_x(ref_freq[i]);
+    y = max(top, min(bot, db_to_y(db_arr[i], top, bot)));
+    lx >= 0 ? gfx_line(lx, ly, x, y, 1);
+    lx = x; ly = y; i += 1;
+  );
+);
+
+function draw_ref_fill(tarr, barr, top, bot) local(i, x, yt, yb, lx, lyt, lyb) (
+  lx = -1; i = 0;
+  loop(ref_num_bins,
+    x  = freq_to_x(ref_freq[i]);
+    yt = max(top, min(bot, db_to_y(tarr[i], top, bot)));
+    yb = max(top, min(bot, db_to_y(barr[i], top, bot)));
+    lx >= 0 ? gfx_triangle(lx, lyb, lx, lyt, x, yt, x, yb);
+    lx = x; lyt = yt; lyb = yb; i += 1;
+  );
+);
+
+// ── reference overlay ─────────────────────────────────────────────────────
+ref_loaded ? (
+  gfx_r = 0.90; gfx_g = 0.50; gfx_b = 0.10; gfx_a = 0.10;
+  draw_ref_fill(ref_mpeak, ref_mmin, mid_top, mid_bot);
+  draw_ref_fill(ref_speak, ref_smin, sid_top, sid_bot);
+
+  gfx_r = 0.80; gfx_g = 0.40; gfx_b = 0.05; gfx_a = 0.70;
+  draw_ref_line(ref_mmin, mid_top, mid_bot);
+  draw_ref_line(ref_smin, sid_top, sid_bot);
+
+  gfx_r = 0.95; gfx_g = 0.62; gfx_b = 0.08; gfx_a = 0.85;
+  draw_ref_line(ref_mavg, mid_top, mid_bot);
+  draw_ref_line(ref_savg, sid_top, sid_bot);
+
+  gfx_r = 1.00; gfx_g = 0.75; gfx_b = 0.25; gfx_a = 0.90;
+  draw_ref_line(ref_mpeak, mid_top, mid_bot);
+  draw_ref_line(ref_speak, sid_top, sid_bot);
+);
+
+// ── live spectra ──────────────────────────────────────────────────────────
+gfx_r = 0.18; gfx_g = 0.44; gfx_b = 0.65; gfx_a = 0.18;
+draw_mag_fill(mid_peak, mid_min, mid_top, mid_bot);
+draw_mag_fill(sid_peak, sid_min, sid_top, sid_bot);
+
+gfx_r = 0.25; gfx_g = 0.55; gfx_b = 0.80; gfx_a = 0.65;
+draw_mag_line(mid_min, mid_top, mid_bot);
+draw_mag_line(sid_min, sid_top, sid_bot);
+
+gfx_r = 0.45; gfx_g = 0.87; gfx_b = 1.00; gfx_a = 0.85;
+draw_mag_line(mid_avg, mid_top, mid_bot);
+draw_mag_line(sid_avg, sid_top, sid_bot);
+
+gfx_r = 0.88; gfx_g = 0.96; gfx_b = 1.00; gfx_a = 1.00;
+draw_mag_line(mid_peak, mid_top, mid_bot);
+draw_mag_line(sid_peak, sid_top, sid_bot);
+
+// ── panel labels ──────────────────────────────────────────────────────────
+gfx_setfont(1);
+gfx_r = gfx_g = gfx_b = 0.50; gfx_a = 1;
+gfx_x = left_margin + 6; gfx_y = mid_top + 4; gfx_drawstr("MID");
+gfx_x = left_margin + 6; gfx_y = sid_top + 4; gfx_drawstr("SIDE");
+gfx_setfont(2);
+
+// ── legend ────────────────────────────────────────────────────────────────
+llx = left_margin + 56; lly = mid_top + 4;
+gfx_r = 0.88; gfx_g = 0.96; gfx_b = 1.00; gfx_a = 1;
+gfx_x = llx; gfx_y = lly; gfx_drawstr("Peak");
+gfx_r = 0.45; gfx_g = 0.87; gfx_b = 1.00;
+gfx_x = llx + 48; gfx_y = lly; gfx_drawstr("Avg");
+gfx_r = 0.25; gfx_g = 0.55; gfx_b = 0.80;
+gfx_x = llx + 88; gfx_y = lly; gfx_drawstr("Min");
+ref_loaded ? (
+  gfx_r = 1.00; gfx_g = 0.75; gfx_b = 0.25;
+  gfx_x = llx + 134; gfx_y = lly; gfx_drawstr("Ref Peak");
+  gfx_r = 0.95; gfx_g = 0.62; gfx_b = 0.08;
+  gfx_x = llx + 204; gfx_y = lly; gfx_drawstr("Ref Avg");
+  gfx_r = 0.80; gfx_g = 0.40; gfx_b = 0.05;
+  gfx_x = llx + 266; gfx_y = lly; gfx_drawstr("Ref Min");
+);
+
+// ── buttons ───────────────────────────────────────────────────────────────
+function draw_btn(bx, by, bw, label, lit) local(tw, th) (
+  gfx_measurestr(label, tw, th);
+  lit ? (gfx_r = 0.25; gfx_g = 0.55; gfx_b = 0.70;) :
+  mouse_x >= bx && mouse_x <= bx+bw && mouse_y >= by && mouse_y <= by+th+8 ? (
+    gfx_r = 0.22; gfx_g = 0.48; gfx_b = 0.60;
+  ) : (gfx_r = 0.13; gfx_g = 0.28; gfx_b = 0.36;);
+  gfx_a = 1;
+  gfx_rect(bx, by, bw, th + 8);
+  gfx_r = 0.85; gfx_g = 0.95; gfx_b = 1.0;
+  gfx_x = bx + (bw - tw) * 0.5; gfx_y = by + 4;
+  gfx_drawstr(label);
+  th + 8;
+);
+
+btn_w  = 58;
+btn_sp = 5;
+btn_y  = 3;
+bx_menu  = gfx_w - btn_w - 6;
+bx_reset = bx_menu  - btn_w - btn_sp;
+bx_clear = bx_reset - btn_w - btn_sp;
+bx_snap  = bx_clear - btn_w - btn_sp;
+
+btn_h = draw_btn(bx_snap,  btn_y, btn_w, "Snapshot", 0);
+        draw_btn(bx_clear, btn_y, btn_w, "Clr Ref",  ref_loaded);
+        draw_btn(bx_reset, btn_y, btn_w, "Reset",    0);
+        draw_btn(bx_menu,  btn_y, btn_w, "Settings", 0);
+
+function btn_hit(bx) ( mouse_x>=bx && mouse_x<=bx+btn_w && mouse_y>=btn_y && mouse_y<=btn_y+btn_h; );
+
+mouse_cap & 1 ? (
+  !btn_snap_dn  && btn_hit(bx_snap)  ? (btn_snap_dn  = 1; take_snapshot(););
+  !btn_clear_dn && btn_hit(bx_clear) ? (btn_clear_dn = 1; ref_loaded = 0; ref_num_bins = 0;);
+  !btn_reset_dn && btn_hit(bx_reset) ? (
+    btn_reset_dn = 1;
+    memset(mid_peak, SMALL_MAG, MAX_BINS);
+    memset(mid_avg,  SMALL_MAG, MAX_BINS);
+    memset(mid_min,  BIG_MAG,   MAX_BINS);
+    memset(sid_peak, SMALL_MAG, MAX_BINS);
+    memset(sid_avg,  SMALL_MAG, MAX_BINS);
+    memset(sid_min,  BIG_MAG,   MAX_BINS);
+  );
+  !btn_menu_dn && btn_hit(bx_menu) ? (
+    btn_menu_dn = 1;
+
+    #menu = ">FFT Size|";
+    fft_size_idx==0 ? #menu += "!"; #menu += "2048|";
+    fft_size_idx==1 ? #menu += "!"; #menu += "4096|";
+    fft_size_idx==2 ? #menu += "!"; #menu += "8192|";
+    fft_size_idx==3 ? #menu += "!"; #menu += "<16384|";
+
+    #menu += ">Avg Time|";
+    avg_time_idx==0 ? #menu += "!"; #menu += "150ms|";
+    avg_time_idx==1 ? #menu += "!"; #menu += "400ms|";
+    avg_time_idx==2 ? #menu += "!"; #menu += "1200ms|";
+    avg_time_idx==3 ? #menu += "!"; #menu += "<3000ms|";
+
+    #menu += ">Peak Decay|";
+    peak_dec_idx==0 ? #menu += "!"; #menu += "Fast|";
+    peak_dec_idx==1 ? #menu += "!"; #menu += "Medium|";
+    peak_dec_idx==2 ? #menu += "!"; #menu += "<Slow|";
+
+    #menu += ">Tilt|";
+    tilt_idx==0 ? #menu += "!"; #menu += "0 dB/oct|";
+    tilt_idx==1 ? #menu += "!"; #menu += "1.5 dB/oct|";
+    tilt_idx==2 ? #menu += "!"; #menu += "3 dB/oct|";
+    tilt_idx==3 ? #menu += "!"; #menu += "4.5 dB/oct|";
+    tilt_idx==4 ? #menu += "!"; #menu += "<6 dB/oct|";
+
+    #menu += ">Ceiling|";
+    ceiling_idx==0 ? #menu += "!"; #menu += "0 dB|";
+    ceiling_idx==1 ? #menu += "!"; #menu += "+20 dB|";
+    ceiling_idx==2 ? #menu += "!"; #menu += "<+40 dB|";
+
+    #menu += ">Floor|";
+    floor_idx==0 ? #menu += "!"; #menu += "-60 dB|";
+    floor_idx==1 ? #menu += "!"; #menu += "-90 dB|";
+    floor_idx==2 ? #menu += "!"; #menu += "<-120 dB|";
+
+    gfx_x = bx_menu; gfx_y = btn_y + btn_h;
+    sel = gfx_showmenu(#menu) - 1;
+
+    sel >= 0 && sel <= 3  ? (fft_size_idx = sel;     apply_settings(););
+    sel >= 4 && sel <= 7  ? (avg_time_idx = sel - 4;  apply_settings(););
+    sel >= 8 && sel <= 10 ? (peak_dec_idx = sel - 8;  apply_settings(););
+    sel >= 11&& sel <= 15 ? (tilt_idx     = sel - 11; apply_settings(););
+    sel >= 16&& sel <= 18 ? (ceiling_idx  = sel - 16; apply_settings(););
+    sel >= 19&& sel <= 21 ? (floor_idx    = sel - 19; apply_settings(););
+  );
+) : (
+  btn_snap_dn = btn_clear_dn = btn_reset_dn = btn_menu_dn = 0;
+);
+
+// ── crosshair + readout ───────────────────────────────────────────────────
+mouse_x >= left_margin && mouse_x < gfx_w - right_margin &&
+mouse_y >= mid_top && mouse_y <= sid_bot ? (
+  gfx_r = gfx_g = gfx_b = 1; gfx_a = 0.15;
+  gfx_line(mouse_x, mid_top, mouse_x, sid_bot, 1);
+  gfx_line(left_margin, mouse_y, gfx_w - right_margin, mouse_y, 1);
+
+  hover_freq = MIN_FREQ * exp(FREQ_LOGMAX * (mouse_x - left_margin) / plot_w);
+  mouse_y <= mid_bot ? (
+    hover_db = ceiling_db + (mouse_y - mid_top) / (mid_bot - mid_top) * (floor_db - ceiling_db);
+  ) : (
+    hover_db = ceiling_db + (mouse_y - sid_top) / (sid_bot - sid_top) * (floor_db - ceiling_db);
+  );
+
+  info = #;
+  hover_freq < 1000 ? sprintf(info, "%.0f Hz  %.1f dB", hover_freq, hover_db)
+                    : sprintf(info, "%.2f kHz  %.1f dB", hover_freq / 1000, hover_db);
+
+  gfx_measurestr(info, iw, ih);
+  ix = mouse_x + 8; ix + iw > gfx_w ? ix = mouse_x - iw - 6;
+  iy = mouse_y - ih - 4; iy < mid_top ? iy = mouse_y + 4;
+
+  gfx_r = 0; gfx_g = 0; gfx_b = 0; gfx_a = 0.55;
+  gfx_rect(ix - 2, iy - 1, iw + 4, ih + 2);
+  gfx_r = 0.45; gfx_g = 0.87; gfx_b = 1.0; gfx_a = 1;
+  gfx_x = ix; gfx_y = iy;
+  gfx_drawstr(info);
+);
