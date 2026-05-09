@@ -19,15 +19,15 @@ MAX_FREQ    = 22050;
 FREQ_LOGMAX = log(MAX_FREQ / MIN_FREQ);
 TILT_PIVOT  = log(1000) / LOG2;
 
-FFT_SIZE    = 8192;
-HIST_SIZE   = 12287;   // FFT_SIZE + FFT_SIZE*0.5 - 1
+FFT_SIZE    = 4096;
+HIST_SIZE   = 6143;    // FFT_SIZE + FFT_SIZE*0.5 - 1
 
 // ── memory layout ──────────────────────────────────────────────────────────
 mem = 0;
 function alloc(n) local(i) ( i = mem; mem += n; i; );
 
-fftwork  = alloc(16384);   // FFT_SIZE * 2 (complex pairs via fft_real)
-win_buf  = alloc(4097);    // FFT_SIZE * 0.5 + 1
+fftwork  = alloc(8192);    // FFT_SIZE * 2 (complex pairs via fft_real)
+win_buf  = alloc(2049);    // FFT_SIZE * 0.5 + 1
 fft_tmp  = alloc(MAX_BINS);  // scratch for smoothing pass
 
 bin_freq = alloc(MAX_BINS);

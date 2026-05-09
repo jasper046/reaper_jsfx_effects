@@ -48,7 +48,7 @@ Use Snapshot to capture a reference mix and then compare your work against it ba
 
 ### Technical details
 
-- Fixed 8192-point FFT with a Blackman-Harris window
+- Fixed 4096-point FFT with a Blackman-Harris window (~93ms frame at 44.1kHz)
 - 1/9-octave log-frequency binning (~90 bands across 10 Hz – 22 kHz)
 - 3-band moving average spectral smoothing applied after binning
 - Single time constant drives all three envelopes: peak decays down, avg is an EMA, min tracks the minimum of avg and decays back up
