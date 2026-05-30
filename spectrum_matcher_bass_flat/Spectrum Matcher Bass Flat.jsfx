@@ -504,7 +504,7 @@ function reset_model(N) local(i, freq) (
 );
 !model_N ? reset_model(floor(slider1 + 0.5));
 
-function copy_to_model() local(i, flat_n, log_sum, flat_level) (
+function copy_to_model() local(i) (
 	model_N = bands_N;
 	model_shortperiod = average1_period;
 	model_longpower = average2_power;
@@ -513,24 +513,6 @@ function copy_to_model() local(i, flat_n, log_sum, flat_level) (
 	while (i < bands_N) (
 		model_target[i] = pow(average2_sum[i]/average2_counter[i], 1/average2_power);
 		i += 1;
-	);
-
-	// Flatten the bottom N bands to their geometric mean so the correction
-	// applies no EQ there — preserving bass dynamics.
-	flat_n = min(floor(bass_flat_bands + 0.5), bands_N);
-	flat_n > 0 ? (
-		log_sum = 0;
-		i = 0;
-		while (i < flat_n) (
-			log_sum += log(model_target[i]);
-			i += 1;
-		);
-		flat_level = exp(log_sum / flat_n);
-		i = 0;
-		while (i < flat_n) (
-			model_target[i] = flat_level;
-			i += 1;
-		);
 	);
 );
 
@@ -882,10 +864,11 @@ function correction_phase(freq) local(wi, wr, hi, hr, pr, pi, pm2, zr, zi, tr, t
 	atan2(hi, hr);
 );
 
-function copy_correction_from_analysis() local(i) (
+function copy_correction_from_analysis() local(i, flat_n) (
+	flat_n = min(floor(bass_flat_bands + 0.5), model_N);
 	i = 0;
 	while (i < model_N) (
-		correction_amp[i] = model_adjustment(i);
+		correction_amp[i] = i < flat_n ? 1 : model_adjustment(i);
 		i += 1;
 	);
 );
