@@ -1,0 +1,228 @@
+desc:Tonal/Noise Splitter
+//tags: processing routing spectral
+//author: HPSS tonal/noise splitter
+
+// Splits a stereo signal into a TONAL (harmonic/pitched/sustained) stream and
+// a NOISE (percussive/transient/broadband) stream using median-filter Harmonic-
+// Percussive Source Separation on an STFT.
+//
+//   output 1/2 = tonal  L/R
+//   output 3/4 = noise  L/R   ( = latency-matched input - tonal )
+//
+// Because the noise stream is the latency-matched input minus the tonal stream,
+// summing all four outputs at unity (e.g. via the Channel Mapper) reconstructs
+// the original signal exactly.
+//
+// The split works on a spectrogram: harmonic energy forms horizontal ridges
+// (stable across time), percussive/noise energy forms vertical ridges (broadband,
+// brief). A median across the last N frames estimates the harmonic part; a median
+// across frequency estimates the percussive part; a soft Wiener-style mask assigns
+// each bin between the two streams.
+//
+// One FFT frame of latency is reported for host compensation.
+
+in_pin:left input
+in_pin:right input
+out_pin:tonal output left
+out_pin:tonal output right
+out_pin:noise output left
+out_pin:noise output right
+
+slider1:split_character=8<0,16,1>Split Character (tonal<->noise)
+slider2:mask_sharpness=2<1,4,0.1>Mask Sharpness
+
+@init
+
+FFT_SIZE = 4096;
+HOP      = 1024;                 // 4x overlap
+NBINS    = FFT_SIZE/2 + 1;       // real-spectrum bins (incl. DC and Nyquist)
+COLA     = 1.5;                  // Hann^2 overlap sum at 4x overlap
+
+T_MEDIAN = 17;                   // trailing frames for the harmonic (time) median
+F_MEDIAN = 17;                   // bins for the percussive (frequency) median
+F_HALF   = (F_MEDIAN - 1) / 2;
+
+// One FFT frame of latency: the analysis frame ends at the current position and
+// the resynthesized frame is overlap-added forward from FFT_SIZE samples back.
+latency     = FFT_SIZE;
+pdc_delay   = latency;
+pdc_bot_ch  = 0;
+pdc_top_ch  = 4;
+
+// ---- memory layout ----
+freemem = 0;
+function alloc(n) local(p) ( p = freemem; freemem += n; p; );
+
+win        = alloc(FFT_SIZE);            // Hann window (analysis + synthesis)
+
+// Ring buffers indexed by a running buffer_index. Length a few frames so the
+// forward overlap-add region never collides with the read pointer.
+BUFLEN     = FFT_SIZE * 4;
+in_l       = alloc(BUFLEN);
+in_r       = alloc(BUFLEN);
+out_l      = alloc(BUFLEN);              // overlap-add accumulator, tonal L
+out_r      = alloc(BUFLEN);
+dly_l      = alloc(BUFLEN);              // latency-matched input copy, for noise
+dly_r      = alloc(BUFLEN);
+
+fft_l      = alloc(FFT_SIZE * 2);        // interleaved complex work buffers
+fft_r      = alloc(FFT_SIZE * 2);
+
+// Ring of the last T_MEDIAN mid-magnitude spectra for the harmonic (time) median.
+// Mid magnitude = max(|L|,|R|) per bin, so both channels share one mask (linked
+// detector -> stable stereo image).
+magring    = alloc(T_MEDIAN * NBINS);
+
+tmp_time   = alloc(T_MEDIAN);            // gather across time for one bin
+tmp_freq   = alloc(F_MEDIAN);            // gather across freq for one bin
+harm_buf   = alloc(NBINS);
+perc_buf   = alloc(NBINS);
+
+function build_window() local(i) (
+  i = 0;
+  loop(FFT_SIZE,
+    win[i] = 0.5 - 0.5*cos(2*$pi*i/FFT_SIZE);
+    i += 1;
+  );
+);
+build_window();
+
+// insertion-sort median of the first n values in buffer b
+function median_n(b, n) local(i, j, key, m) (
+  i = 1;
+  loop(n - 1,
+    key = b[i];
+    j = i - 1;
+    while (j >= 0 && b[j] > key) ( b[j+1] = b[j]; j -= 1; );
+    b[j+1] = key;
+    i += 1;
+  );
+  m = (n - 1) / 2;
+  b[m];
+);
+
+memset(in_l, 0, BUFLEN);  memset(in_r, 0, BUFLEN);
+memset(out_l, 0, BUFLEN); memset(out_r, 0, BUFLEN);
+memset(dly_l, 0, BUFLEN); memset(dly_r, 0, BUFLEN);
+memset(magring, 0, T_MEDIAN * NBINS);
+
+bidx    = 0;
+ctr     = 0;
+frames  = 0;
+
+@slider
+
+// Split Character biases the harmonic estimate: 0 = everything leans noise,
+// 16 = everything leans tonal, 8 = neutral.
+harm_bias  = 2 ^ ((split_character - 8) / 8);   // 0.5 .. 2.0
+mask_power = mask_sharpness;
+
+@sample
+
+in_l[bidx] = spl0; in_r[bidx] = spl1;
+dly_l[bidx] = spl0; dly_r[bidx] = spl1;
+
+(ctr += 1) >= HOP ? (
+  ctr = 0;
+
+  // --- window the FFT_SIZE samples ending at the current position ---
+  bi = bidx - FFT_SIZE;
+  fi = 0;
+  loop(FFT_SIZE,
+    i2 = bi + fi; i2 < 0 ? i2 += BUFLEN;
+    fft_l[fi*2] = in_l[i2] * win[fi]; fft_l[fi*2+1] = 0;
+    fft_r[fi*2] = in_r[i2] * win[fi]; fft_r[fi*2+1] = 0;
+    fi += 1;
+  );
+
+  fft(fft_l, FFT_SIZE); fft_permute(fft_l, FFT_SIZE);
+  fft(fft_r, FFT_SIZE); fft_permute(fft_r, FFT_SIZE);
+
+  // --- push this frame's mid magnitude into the time-median ring ---
+  head = frames % T_MEDIAN;
+  mg = magring + head * NBINS;
+  bn = 0;
+  loop(NBINS,
+    rl = fft_l[bn*2]; il = fft_l[bn*2+1];
+    rr = fft_r[bn*2]; ir = fft_r[bn*2+1];
+    ml = sqrt(rl*rl + il*il);
+    mr = sqrt(rr*rr + ir*ir);
+    mg[bn] = max(ml, mr);
+    bn += 1;
+  );
+  frames += 1;
+
+  // --- harmonic estimate: per-bin median across the T_MEDIAN trailing frames ---
+  bn = 0;
+  loop(NBINS,
+    k = 0;
+    loop(T_MEDIAN,
+      tmp_time[k] = magring[k * NBINS + bn];
+      k += 1;
+    );
+    harm_buf[bn] = median_n(tmp_time, T_MEDIAN) * harm_bias;
+    bn += 1;
+  );
+
+  // --- percussive estimate: freq-median of the newest frame (reflect-padded) ---
+  cmg = magring + head * NBINS;
+  bn = 0;
+  loop(NBINS,
+    j = 0;
+    loop(F_MEDIAN,
+      idx = bn - F_HALF + j;
+      idx < 0 ? idx = -idx;
+      idx > NBINS - 1 ? idx = 2*(NBINS-1) - idx;
+      tmp_freq[j] = cmg[idx];
+      j += 1;
+    );
+    perc_buf[bn] = median_n(tmp_freq, F_MEDIAN);
+    bn += 1;
+  );
+
+  // --- soft mask -> tonal spectrum, mirror conjugate half, inverse FFT ---
+  bn = 0;
+  loop(NBINS,
+    hp = pow(harm_buf[bn], mask_power);
+    pp = pow(perc_buf[bn], mask_power);
+    m = hp / (hp + pp + 0.0000000001);
+    fft_l[bn*2] *= m; fft_l[bn*2+1] *= m;
+    fft_r[bn*2] *= m; fft_r[bn*2+1] *= m;
+    bn += 1;
+  );
+  bn = 1;
+  loop(FFT_SIZE/2 - 1,
+    dst = FFT_SIZE - bn;
+    fft_l[dst*2] = fft_l[bn*2]; fft_l[dst*2+1] = -fft_l[bn*2+1];
+    fft_r[dst*2] = fft_r[bn*2]; fft_r[dst*2+1] = -fft_r[bn*2+1];
+    bn += 1;
+  );
+
+  fft_ipermute(fft_l, FFT_SIZE); ifft(fft_l, FFT_SIZE);
+  fft_ipermute(fft_r, FFT_SIZE); ifft(fft_r, FFT_SIZE);
+
+  // --- overlap-add forward from FFT_SIZE samples back ---
+  fi = 0;
+  loop(FFT_SIZE,
+    i2 = bi + fi; i2 < 0 ? i2 += BUFLEN;
+    g = win[fi] / (COLA * FFT_SIZE);       // synthesis window + ifft/COLA scaling
+    out_l[i2] += fft_l[fi*2] * g;
+    out_r[i2] += fft_r[fi*2] * g;
+    fi += 1;
+  );
+);
+
+// --- read finished output one frame behind the write pointer ---
+op = bidx - latency; op < 0 ? op += BUFLEN;
+
+tonal_l = out_l[op]; tonal_r = out_r[op];
+din_l   = dly_l[op]; din_r   = dly_r[op];
+
+out_l[op] = 0; out_r[op] = 0;             // consume accumulator for reuse
+
+spl0 = tonal_l;
+spl1 = tonal_r;
+spl2 = din_l - tonal_l;                   // noise = latency-matched input - tonal
+spl3 = din_r - tonal_r;
+
+(bidx += 1) >= BUFLEN ? bidx = 0;
