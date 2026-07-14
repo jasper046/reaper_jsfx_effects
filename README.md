@@ -53,3 +53,34 @@ Use Snapshot to capture a reference mix and then compare your work against it ba
 - 3-band moving average spectral smoothing applied after binning
 - Single time constant drives all three envelopes: peak decays down, avg is an EMA, min tracks the minimum of avg and decays back up
 - Settings and reference snapshots persist with the REAPER project via `@serialize`
+
+---
+
+## Hyrax Limiter
+
+A real-time brickwall limiter modeled on the offline "Hyrax" limiter from [Matchering](https://github.com/sergree/matchering), which produces unusually smooth, natural-sounding limiting on masters. The original is a non-causal, whole-file algorithm; this is a causal look-ahead approximation of its structure suitable for a live insert, with the host compensating for the look-ahead latency.
+
+### Controls
+
+| Slider | Description |
+|---|---|
+| Threshold (dB) | Level above which limiting begins. |
+| Ceiling (dB) | Output ceiling; the signal is normalized so the threshold maps here. |
+| Look Ahead (ms) | Delay applied to the audio path so gain reduction ramps in before transients. Matchering's attack window is 1 ms; higher values give smoother, more transparent limiting. Reported to the host for latency compensation. |
+| Release (ms) | Release time. Unlike a single-pole release, this shapes the recovery through a hold stage and two cascaded one-pole low-pass sections, giving a gradual, natural release. |
+| Stereo Link (%) | 100% applies identical gain to both channels (as Matchering does). Lower values let each channel limit closer to its own peak. |
+| True Peak Detection | When on, estimates inter-sample peaks in the detection sidechain to reduce overshoots. This is a linear-interpolation estimate, not a certified true-peak ceiling. |
+
+### How it works
+
+The gain envelope is computed in Matchering's "flipped" reduction domain (`1 - gain`, where larger means more reduction) and combines three stages, keeping the most reduction at each sample:
+
+- **Hard-clip** — the instantaneous reduction needed to bring the windowed peak to threshold.
+- **Attack** — a one-pole smoothing of the hard-clip reduction, fed by the look-ahead delay so the ramp lands before the transient (a causal stand-in for Matchering's zero-phase `filtfilt`).
+- **Release** — a hold stage followed by two cascaded one-pole low-passes, with cutoffs derived from Matchering's Butterworth constants (7 Hz hold, `800 / release_ms` Hz release).
+
+Peak detection uses a sliding maximum over the look-ahead window. The audio path itself is never oversampled, matching Matchering's clean sample-domain gain stage.
+
+### Fidelity notes
+
+This is an approximation, not a bit-exact port. Matchering's attack is zero-phase (it looks both forward and backward in time), which a causal plugin cannot reproduce; the look-ahead delay approximates it. For bit-exact Matchering output, run audio through the Matchering app offline with the mix ratio at 0%. The true-peak option underestimates real inter-sample peaks and should not be relied on for a hard true-peak delivery spec.

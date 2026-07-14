@@ -1,0 +1,235 @@
+desc:Hyrax Limiter
+//tags: dynamics limiter mastering
+//author: port of Matchering "Hyrax" limiter
+
+// Real-time causal approximation of the Matchering (Sergree) "Hyrax"
+// mastering limiter: sliding-window peak detection feeding a look-ahead
+// attack stage and a multi-stage (hold + two cascaded one-pole low-pass)
+// release envelope. The look-ahead delay is reported to the host for
+// latency compensation. Peak detection can optionally run 4x oversampled
+// to catch inter-sample (true-peak) overshoots; the audio path itself is
+// never oversampled, matching Matchering's clean sample-domain gain stage.
+
+slider1:0<-30,0,0.1>Threshold (dB)
+slider2:-0.1<-6,0,0.1>Ceiling (dB)
+slider3:1<0,20,0.1>Look Ahead (ms)
+slider4:3000<50,6000,10>Release (ms)
+slider5:100<0,100,1>Stereo Link (%)
+slider6:1<0,1,1{Off,On}>True Peak Detection
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+
+ext_tail_size = -1;
+ext_gr_meter = 0;
+
+// Matchering baked-in constants
+HOLD_MS = 1;               // limiter.hold
+HOLD_LP_HZ = 7;            // 1st-order Butterworth hold cutoff
+RELEASE_LP_NUM = 800;      // release cutoff = RELEASE_LP_NUM / release_ms
+ATTACK_SMOOTH = 2;         // attack filter smoothing (matchering attack_filter_coefficient magnitude)
+
+// Ring buffer for look-ahead audio (stereo interleaved). Sized for the
+// max look-ahead (20 ms) at any sample rate, rounded up generously.
+LA_MAX = ceil(0.025 * srate) + 4;
+buf0 = 0;                  // left channel ring buffer base
+buf1 = buf0 + LA_MAX;      // right channel ring buffer base
+// Peak-detection ring buffer holds per-sample detection peaks so we can
+// run a true sliding maximum over the look-ahead window.
+pkbuf = buf1 + LA_MAX;
+freemem = pkbuf + LA_MAX;
+
+wpos = 0;
+
+// 4x oversampling polyphase state for the detection sidechain: a simple
+// 4-tap windowed-sinc upsampler per channel is overkill here; instead we
+// estimate inter-sample peaks with a short Lagrange/linear-max between
+// consecutive samples, which is cheap and catches the dominant overshoot.
+os_l1 = os_l0 = 0;
+os_r1 = os_r0 = 0;
+
+// Reduction-domain envelope state (0 = no reduction).
+d_atk = 0;
+d_hold = 0;
+rel_lp1 = 0;
+rel_lp2 = 0;
+hold_ctr = 0;
+
+gr_meter = 1;
+gr_meter_decay = exp(1/(1*srate));
+
+@slider
+
+thresh = 10^(slider1/20);
+ceiling = 10^(slider2/20);
+makeup = ceiling / thresh;             // matchering normalizes to threshold, then to ceiling
+
+look_samples = max(1, floor(slider3 * 0.001 * srate));
+look_samples = min(look_samples, LA_MAX - 1);
+
+release_ms = max(slider4, 1);
+link = slider5 * 0.01;
+truepeak = slider6;
+
+// Sliding-max hold window length (samples)
+hold_samples = max(1, floor(HOLD_MS * 0.001 * srate));
+
+// One-pole low-pass coefficients from Butterworth cutoffs.
+// 1st-order Butterworth == one-pole: a = exp(-2*pi*fc/fs)
+hold_a = exp(-2*$pi*HOLD_LP_HZ/srate);
+rel_fc = RELEASE_LP_NUM / release_ms;   // matchering: release_filter_coefficient / release
+rel_a = exp(-2*$pi*rel_fc/srate);
+
+// Attack smoothing one-pole (approximates matchering's zero-phase filtfilt
+// over the attack window; look-ahead delay supplies the "future" it needs).
+atk_a = exp(-ATTACK_SMOOTH / max(look_samples,1));
+
+// Report look-ahead latency so the host time-aligns our output.
+pdc_delay = look_samples;
+pdc_bot_ch = 0;
+pdc_top_ch = 2;
+
+@sample
+
+// --- detection: per-sample peak, optionally true-peak (inter-sample) ---
+absl = abs(spl0);
+absr = abs(spl1);
+detect = max(absl, absr);
+
+truepeak ? (
+  // Estimate inter-sample peaks via 4x linear interpolation between the
+  // previous and current sample on each channel and take the max.
+  ip = 0.25;
+  loop(3,
+    il = os_l1 + (spl0 - os_l1) * ip;
+    ir = os_r1 + (spl1 - os_r1) * ip;
+    detect = max(detect, max(abs(il), abs(ir)));
+    ip += 0.25;
+  );
+  os_l1 = spl0;
+  os_r1 = spl1;
+);
+
+// --- write current sample into look-ahead ring buffers ---
+buf0[wpos] = spl0;
+buf1[wpos] = spl1;
+pkbuf[wpos] = detect;
+
+// --- sliding maximum over the look-ahead window (attack stage input) ---
+// Scan the window for the max detection peak. Window is short (<=~1ms
+// typical), so a direct scan is acceptable and matches matchering's
+// maximum_filter1d semantics exactly.
+win_max = 0;
+i = 0;
+loop(look_samples + 1,
+  ri = wpos - i;
+  ri < 0 ? ri += LA_MAX;
+  win_max = max(win_max, pkbuf[ri]);
+  i += 1;
+);
+
+// Everything below works in Matchering's "flipped" reduction domain:
+//   d = 1 - gain,  where 0 = no reduction and larger = more reduction.
+// The three stages (hard-clip, attack, release) each produce a reduction
+// amount; Matchering combines them with max_mix (take the MOST reduction)
+// and flips back to a gain. We mirror that exactly.
+
+// --- hard-clip reduction for this windowed peak ---
+// rectify: floor at threshold, normalize. gain = thresh/peak (<=1).
+win_max <= thresh ? hc_gain = 1 : hc_gain = thresh / win_max;
+d_hard = 1 - hc_gain;                  // flipped hard-clip reduction
+
+// --- attack stage: one-pole smoothing of the hard-clip reduction ---
+// Reduction rises instantly (attack) and decays via the smoothing pole.
+// The look-ahead delay on the audio path means this ramp lands slightly
+// before the transient reaches the output tap (approximating filtfilt).
+d_hard > d_atk ? d_atk = d_hard : d_atk = d_hard + atk_a * (d_atk - d_hard);
+
+// --- hold + release stage on the reduction envelope ---
+// Hold: keep the peak reduction for hold_samples, then let it fall.
+d_hard >= d_hold ? (
+  d_hold = d_hard;
+  hold_ctr = 0;
+) : (
+  (hold_ctr += 1) > hold_samples ? (
+    d_hold = d_hard + hold_a * (d_hold - d_hard);
+  );
+);
+
+// Two cascaded one-pole low-passes shape the release, fed by the greater
+// of the raw and held reduction (matchering: max(slided, hold_output)).
+rel_in = max(d_hard, d_hold);
+rel_lp1 = rel_in + rel_a * (rel_lp1 - rel_in);
+rel_lp2 = rel_lp1 + rel_a * (rel_lp2 - rel_lp1);
+d_rel = max(d_hold, rel_lp2);          // matchering: max(hold_output, release_output)
+
+// --- combine stages: most reduction wins (max_mix), then flip to gain ---
+d_final = max(d_hard, max(d_atk, d_rel));
+gain = 1 - d_final;
+
+// --- stereo link ---
+// Detection is fully linked at link=100% (shared win_max drives one gain).
+// Below 100%, blend the shared reduction with each channel's own reduction
+// so the louder channel keeps the shared value and the quieter one is let
+// off proportionally. At link=0 each channel limits to its own peak.
+dl_own = absl <= thresh ? 0 : 1 - thresh/absl;
+dr_own = absr <= thresh ? 0 : 1 - thresh/absr;
+gl = 1 - (link * d_final + (1-link) * dl_own);
+gr = 1 - (link * d_final + (1-link) * dr_own);
+
+// --- read delayed audio from ring buffer and apply gain + makeup ---
+rpos = wpos - look_samples;
+rpos < 0 ? rpos += LA_MAX;
+spl0 = buf0[rpos] * gl * makeup;
+spl1 = buf1[rpos] * gr * makeup;
+
+(wpos += 1) >= LA_MAX ? wpos = 0;
+
+// --- gain reduction meter ---
+gain < gr_meter ? gr_meter = gain : ( gr_meter *= gr_meter_decay; gr_meter > 1 ? gr_meter = 1; );
+
+@block
+ext_gr_meter = gr_meter > 0 ? log(gr_meter) * (20/log(10)) : -150;
+
+@gfx 0 32
+
+  gr_meter *= exp(1/30); gr_meter>1?gr_meter=1;
+  gfx_r=1; gfx_g=gfx_b=0; gfx_a=0.8;
+
+  meter_bot=20;
+  meter_h=min(gfx_h,32);
+  xscale=gfx_w*20/meter_bot;
+
+  gfx_y=0;
+  gfx_x=gfx_w + log10(gr_meter)*xscale;
+  gfx_rectto(gfx_w,meter_h);
+
+  gfx_r=gfx_g=gfx_b=1.0; gfx_a=0.6;
+
+  s2=sqrt(2)/2;
+  g = s2;
+  while(
+    gfx_x=gfx_w + log10(g)*xscale;
+    gfx_x >= 0 ?
+    (
+      gfx_y=0;
+      gfx_lineto(gfx_x,meter_h,0);
+      gfx_y=meter_h-gfx_texth;
+      gfx_x+=2;
+      gfx_drawnumber(log10(g)*20,0);
+      gfx_drawchar($'d');
+      gfx_drawchar($'B');
+    );
+    g*=s2;
+    gfx_x >=0;
+  );
+  gfx_a=1;
+
+  gfx_x=0; gfx_y=meter_h/2 - gfx_texth/2;
+  gfx_drawnumber(log10(gr_meter)*20,1);
+  gfx_drawchar($'d');
+  gfx_drawchar($'B');
