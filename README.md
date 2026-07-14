@@ -94,7 +94,11 @@ insert, with the host compensating for the look-ahead latency.
 
 ### LUFS metering and SENSE
 
-The plugin measures its **output** loudness as short-term LUFS (BS.1770 K-weighting, a 3-second window) and displays it under the gain-reduction meter. With **SENSE** enabled, a slow, damped feedback loop rides the Threshold slider so the output loudness approaches the Target LUFS — lowering the threshold increases limiting and makeup gain, raising loudness, and vice versa. The loop is intentionally gentle (it takes several seconds to settle) to stay stable against the 3-second measurement window and avoid pumping. Turning SENSE off leaves the threshold wherever the loop left it, handing manual control back to you. The Ceiling is never touched by SENSE, so your true-peak headroom stays put.
+The plugin measures its **output** loudness as short-term LUFS (BS.1770 K-weighting, a 3-second window) and displays it on the graphical panel. With **SENSE** enabled, a slow, damped feedback loop rides the Threshold slider so the output loudness approaches the Target LUFS — lowering the threshold increases limiting and makeup gain, raising loudness, and vice versa. The loop is intentionally gentle (it takes several seconds to settle) to stay stable against the 3-second measurement window and avoid pumping. Turning SENSE off leaves the threshold wherever the loop left it, handing manual control back to you. The Ceiling is never touched by SENSE, so your true-peak headroom stays put. To read the input loudness, set the Threshold to 0 dB (no limiting) — the output reading then equals the input.
+
+### Interface
+
+The graphical panel shows a horizontal **gain-reduction meter** (full scale −6 dB, since a mastering-grade limiter rarely needs to pull more than ~3 dB), the **output short-term LUFS** as a large number with the target beneath it, and clickable **TRUE PEAK** and **SENSE** buttons (these mirror their sliders, so host automation and preset recall still work).
 
 ### How it works
 

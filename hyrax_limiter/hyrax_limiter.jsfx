@@ -64,6 +64,27 @@ hold_ctr = 0;
 gr_meter = 1;
 gr_meter_decay = exp(1/(1*srate));
 
+last_cap = 0;              // mouse button edge-detection for UI buttons
+
+// A clickable UI button: draws a box (lit when `on`), returns 1 on a fresh
+// press inside its rectangle (mouse_cap rising edge). `label` is a string.
+function btn(bx, by, bw, bh, on, label) local(hit, over, lw, lh) (
+  over = mouse_x >= bx && mouse_x < bx+bw && mouse_y >= by && mouse_y < by+bh;
+  on ? ( gfx_r=0.15; gfx_g=0.55; gfx_b=0.45; ) : ( gfx_r=gfx_g=gfx_b=0.16; );
+  gfx_a = 1;
+  gfx_x=bx; gfx_y=by; gfx_rectto(bx+bw, by+bh);
+  on ? ( gfx_r=0.3; gfx_g=1.0; gfx_b=0.8; ) : over ? ( gfx_r=gfx_g=gfx_b=0.5; ) : ( gfx_r=gfx_g=gfx_b=0.32; );
+  gfx_a=1;
+  gfx_line(bx, by, bx+bw, by); gfx_line(bx, by+bh, bx+bw, by+bh);
+  gfx_line(bx, by, bx, by+bh); gfx_line(bx+bw, by, bx+bw, by+bh);
+  gfx_measurestr(label, lw, lh);
+  gfx_x = bx + (bw-lw)*0.5; gfx_y = by + (bh-lh)*0.5;
+  on ? ( gfx_r=gfx_g=gfx_b=1.0; ) : ( gfx_r=gfx_g=gfx_b=0.7; );
+  gfx_drawstr(label);
+  hit = over && (mouse_cap&1) && !(last_cap&1);
+  hit;
+);
+
 // --- ITU-R BS.1770 K-weighting filter (two biquads, run on mono output sum) ---
 // Stage 1: high-shelf (+4 dB boost above ~1681 Hz). Stage 2: high-pass (~38 Hz).
 // Coefficients are the standard 48 kHz reference values, re-derived here for the
@@ -117,7 +138,7 @@ lufs_st  = -144;           // current short-term LUFS reading
 // SENSE loop state: slow, damped adjustment of the threshold slider.
 // Gain and rate are tuned for stability against the 3 s measurement lag: a
 // faster loop oscillates because it reacts to stale short-term readings.
-sense_gain = 0.05;         // proportional step fraction of the LUFS error, tuned below
+sense_gain = 0.03;         // proportional step fraction of the LUFS error, tuned below
 sense_rate_db = 0.5;       // max threshold movement in dB per second
 sense_update_ctr = 0;
 sense_update_every = floor(srate / 20);  // recompute the loop 20x/sec
@@ -306,56 +327,67 @@ gain < gr_meter ? gr_meter = gain : ( gr_meter *= gr_meter_decay; gr_meter > 1 ?
 @block
 ext_gr_meter = gr_meter > 0 ? log(gr_meter) * (20/log(10)) : -150;
 
-@gfx 0 64
+@gfx 420 150
 
+  // decay the GR meter here too so it releases when audio stops
   gr_meter *= exp(1/30); gr_meter>1?gr_meter=1;
-  gfx_r=1; gfx_g=gfx_b=0; gfx_a=0.8;
 
-  meter_bot=20;
-  meter_h=min(gfx_h,32);
-  xscale=gfx_w*20/meter_bot;
+  gfx_clear = 0;
+  pad = 12;
+  sc = max(1, gfx_w/420);
 
-  gfx_y=0;
-  gfx_x=gfx_w + log10(gr_meter)*xscale;
-  gfx_rectto(gfx_w,meter_h);
+  // ================= gain reduction meter (top) =================
+  m_x = pad; m_y = pad; m_w = gfx_w - 2*pad; m_h = 26;
+  GR_RANGE = 6;   // full-scale reduction (dB); mastering lives in 0..3 dB
+  // 0 dB (right) down to -GR_RANGE (left); pins at full beyond the range
+  gr_db = gr_meter > 0 ? 20*log10(gr_meter) : -GR_RANGE;
+  gr_db < -GR_RANGE ? gr_db = -GR_RANGE;
+  // track
+  gfx_r=gfx_g=gfx_b=0.12; gfx_a=1;
+  gfx_x=m_x; gfx_y=m_y; gfx_rectto(m_x+m_w, m_y+m_h);
+  // fill from right, growing left as reduction increases
+  fillw = -gr_db/GR_RANGE * m_w;
+  gfx_r=0.9; gfx_g=0.35; gfx_b=0.2; gfx_a=1;
+  gfx_x = m_x + m_w - fillw; gfx_y=m_y; gfx_rectto(m_x+m_w, m_y+m_h);
+  // ticks every 1 dB
+  gfx_r=gfx_g=gfx_b=0.55; gfx_a=1;
+  td = 1;
+  while (td < GR_RANGE ? (
+    tx = m_x + m_w - (td/GR_RANGE)*m_w;
+    gfx_line(tx, m_y, tx, m_y+m_h);
+    td += 1; 1;
+  ) : 0);
+  // current GR number, right-aligned in the meter
+  gfx_r=gfx_g=gfx_b=1.0;
+  gfx_x = m_x+4; gfx_y = m_y + (m_h-gfx_texth)*0.5;
+  gfx_drawstr("GR ");
+  gfx_drawnumber(gr_db, 1); gfx_drawstr(" dB");
 
-  gfx_r=gfx_g=gfx_b=1.0; gfx_a=0.6;
-
-  s2=sqrt(2)/2;
-  g = s2;
-  while(
-    gfx_x=gfx_w + log10(g)*xscale;
-    gfx_x >= 0 ?
-    (
-      gfx_y=0;
-      gfx_lineto(gfx_x,meter_h,0);
-      gfx_y=meter_h-gfx_texth;
-      gfx_x+=2;
-      gfx_drawnumber(log10(g)*20,0);
-      gfx_drawchar($'d');
-      gfx_drawchar($'B');
-    );
-    g*=s2;
-    gfx_x >=0;
-  );
-  gfx_a=1;
-
-  gfx_x=0; gfx_y=meter_h/2 - gfx_texth/2;
-  gfx_drawnumber(log10(gr_meter)*20,1);
-  gfx_drawchar($'d');
-  gfx_drawchar($'B');
-
-  // --- short-term LUFS readout row (below the GR meter) ---
-  lrow_y = meter_h + 4;
-  gfx_a = 1;
-  // short-term LUFS value
-  gfx_x = 4; gfx_y = lrow_y;
-  gfx_r = gfx_g = gfx_b = 1.0;
+  // ================= OUT LUFS (big number) =================
+  l_y = m_y + m_h + 14;
+  gfx_r=gfx_g=gfx_b=0.6; gfx_a=1;
+  gfx_x = pad; gfx_y = l_y;
+  gfx_drawstr("OUT LUFS-S");
+  label_h = gfx_texth;
+  gfx_setfont(1, "Arial", 26*sc, 'b');
+  gfx_r=gfx_g=gfx_b=1.0;
+  gfx_x = pad; gfx_y = l_y + label_h + 2;
   lufs_st > -70 ? gfx_drawnumber(lufs_st, 1) : gfx_drawstr("-inf");
-  gfx_drawstr(" LUFS-S");
-  // target + SENSE status
-  gfx_x = 4; gfx_y = lrow_y + gfx_texth + 2;
-  sense_on ? ( gfx_r = 0.4; gfx_g = 1.0; gfx_b = 0.4; ) : ( gfx_r = gfx_g = gfx_b = 0.6; );
-  gfx_drawstr(sense_on ? "SENSE > " : "target ");
-  gfx_drawnumber(target_lufs, 1);
-  gfx_drawstr(" LUFS");
+  big_h = gfx_texth;
+  gfx_setfont(0);
+  // target readout under the big number
+  gfx_r=gfx_g=gfx_b=0.55;
+  gfx_x = pad; gfx_y = l_y + label_h + big_h + 6;
+  gfx_drawstr("target "); gfx_drawnumber(target_lufs, 1); gfx_drawstr(" LUFS");
+
+  // ================= buttons (right side) =================
+  bw = 120; bh = 34; bx = gfx_w - pad - bw;
+  tp_y = l_y; sn_y = l_y + bh + 10;
+  btn(bx, tp_y, bw, bh, truepeak, "TRUE PEAK") ? (
+    slider6 = truepeak = !truepeak; slider_automate(slider6);
+  );
+  btn(bx, sn_y, bw, bh, sense_on, "SENSE") ? (
+    slider8 = sense_on = !sense_on; slider_automate(slider8);
+  );
+
+  last_cap = mouse_cap;
