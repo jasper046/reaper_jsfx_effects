@@ -89,6 +89,12 @@ insert, with the host compensating for the look-ahead latency.
 | Release (ms) | Release time. Unlike a single-pole release, this shapes the recovery through a hold stage and two cascaded one-pole low-pass sections, giving a gradual, natural release. |
 | Stereo Link (%) | 100% applies identical gain to both channels (as Matchering does). Lower values let each channel limit closer to its own peak. |
 | True Peak Detection | When on, estimates inter-sample peaks in the detection sidechain to reduce overshoots. This is a linear-interpolation estimate, not a certified true-peak ceiling. |
+| Target LUFS (short-term) | The loudness target for the SENSE loop (short-term, 3 s). |
+| SENSE (auto threshold) | When on, slowly rides the Threshold to bring the output's short-term LUFS toward the target. When off, the Threshold is frozen at its current value and manually adjustable again. |
+
+### LUFS metering and SENSE
+
+The plugin measures its **output** loudness as short-term LUFS (BS.1770 K-weighting, a 3-second window) and displays it under the gain-reduction meter. With **SENSE** enabled, a slow, damped feedback loop rides the Threshold slider so the output loudness approaches the Target LUFS — lowering the threshold increases limiting and makeup gain, raising loudness, and vice versa. The loop is intentionally gentle (it takes several seconds to settle) to stay stable against the 3-second measurement window and avoid pumping. Turning SENSE off leaves the threshold wherever the loop left it, handing manual control back to you. The Ceiling is never touched by SENSE, so your true-peak headroom stays put.
 
 ### How it works
 

@@ -16,6 +16,8 @@ slider3:1<0,20,0.1>Look Ahead (ms)
 slider4:3000<50,6000,10>Release (ms)
 slider5:100<0,100,1>Stereo Link (%)
 slider6:1<0,1,1{Off,On}>True Peak Detection
+slider7:-14<-30,-5,0.1>Target LUFS (short-term)
+slider8:0<0,1,1{Off,On}>SENSE (auto threshold)
 
 in_pin:left input
 in_pin:right input
@@ -62,6 +64,64 @@ hold_ctr = 0;
 gr_meter = 1;
 gr_meter_decay = exp(1/(1*srate));
 
+// --- ITU-R BS.1770 K-weighting filter (two biquads, run on mono output sum) ---
+// Stage 1: high-shelf (+4 dB boost above ~1681 Hz). Stage 2: high-pass (~38 Hz).
+// Coefficients are the standard 48 kHz reference values, re-derived here for the
+// actual sample rate so the meter is correct at any rate.
+function kweight_coeffs() local(
+  db_boost, fc_shelf, Q_shelf, K, Vh, Vb, a0s,
+  fc_hp, Q_hp, w0, alpha, cw, a0h) (
+  // --- high-shelf (pre-filter, "stage 1") ---
+  db_boost = 3.999843853973347;
+  fc_shelf = 1681.974450955533;
+  Q_shelf  = 0.7071752369554196;
+  K  = tan($pi * fc_shelf / srate);
+  Vh = 10^(db_boost/20);
+  Vb = Vh^0.4996667741545416;
+  a0s = 1 + K/Q_shelf + K*K;
+  sh_b0 = (Vh + Vb*K/Q_shelf + K*K) / a0s;
+  sh_b1 = 2*(K*K - Vh) / a0s;
+  sh_b2 = (Vh - Vb*K/Q_shelf + K*K) / a0s;
+  sh_a1 = 2*(K*K - 1) / a0s;
+  sh_a2 = (1 - K/Q_shelf + K*K) / a0s;
+  // --- high-pass ("stage 2") ---
+  fc_hp = 38.13547087602444;
+  Q_hp  = 0.5003270373238773;
+  w0 = 2*$pi*fc_hp/srate;
+  cw = cos(w0);
+  alpha = sin(w0)/(2*Q_hp);
+  a0h = 1 + alpha;
+  hp_b0 = (1 + cw)/2 / a0h;
+  hp_b1 = -(1 + cw) / a0h;
+  hp_b2 = (1 + cw)/2 / a0h;
+  hp_a1 = -2*cw / a0h;
+  hp_a2 = (1 - alpha) / a0h;
+);
+kweight_coeffs();
+
+// biquad state for the two K-weighting stages, per channel (L and R measured
+// independently, then their mean-squares summed per BS.1770).
+shl_z1 = shl_z2 = hpl_z1 = hpl_z2 = 0;
+shr_z1 = shr_z2 = hpr_z1 = hpr_z2 = 0;
+
+// 3-second short-term LUFS: running sum of K-weighted mean square over a
+// circular buffer holding one sample of squared value per slot.
+ST_LEN   = ceil(3 * srate);
+msbuf    = freemem;
+freemem += ST_LEN;
+memset(msbuf, 0, ST_LEN);
+mspos    = 0;
+ms_sum   = 0;
+lufs_st  = -144;           // current short-term LUFS reading
+
+// SENSE loop state: slow, damped adjustment of the threshold slider.
+// Gain and rate are tuned for stability against the 3 s measurement lag: a
+// faster loop oscillates because it reacts to stale short-term readings.
+sense_gain = 0.05;         // proportional step fraction of the LUFS error, tuned below
+sense_rate_db = 0.5;       // max threshold movement in dB per second
+sense_update_ctr = 0;
+sense_update_every = floor(srate / 20);  // recompute the loop 20x/sec
+
 @slider
 
 thresh = 10^(slider1/20);
@@ -74,6 +134,8 @@ look_samples = min(look_samples, LA_MAX - 1);
 release_ms = max(slider4, 1);
 link = slider5 * 0.01;
 truepeak = slider6;
+target_lufs = slider7;
+sense_on = slider8;
 
 // Sliding-max hold window length (samples)
 hold_samples = max(1, floor(HOLD_MS * 0.001 * srate));
@@ -189,13 +251,62 @@ spl1 = buf1[rpos] * gr * makeup;
 
 (wpos += 1) >= LA_MAX ? wpos = 0;
 
+// --- short-term LUFS measurement on the output (BS.1770 K-weighting) ---
+// Each channel through its own K-weighting biquad pair; sum the per-channel
+// mean-squares (channel weight 1.0 for L/R) as the standard specifies.
+shl = sh_b0*spl0 + shl_z1;
+shl_z1 = sh_b1*spl0 - sh_a1*shl + shl_z2;
+shl_z2 = sh_b2*spl0 - sh_a2*shl;
+kl = hp_b0*shl + hpl_z1;
+hpl_z1 = hp_b1*shl - hp_a1*kl + hpl_z2;
+hpl_z2 = hp_b2*shl - hp_a2*kl;
+
+shr = sh_b0*spl1 + shr_z1;
+shr_z1 = sh_b1*spl1 - sh_a1*shr + shr_z2;
+shr_z2 = sh_b2*spl1 - sh_a2*shr;
+kr = hp_b0*shr + hpr_z1;
+hpr_z1 = hp_b1*shr - hp_a1*kr + hpr_z2;
+hpr_z2 = hp_b2*shr - hp_a2*kr;
+
+// slide the 3-second mean-square window (summed L^2 + R^2)
+ksq = kl*kl + kr*kr;
+ms_sum += ksq - msbuf[mspos];
+msbuf[mspos] = ksq;
+(mspos += 1) >= ST_LEN ? mspos = 0;
+
+// --- SENSE closed loop: ride the threshold slider toward the target LUFS ---
+(sense_update_ctr += 1) >= sense_update_every ? (
+  sense_update_ctr = 0;
+  mean_ms = ms_sum / ST_LEN;
+  lufs_st = mean_ms > 0 ? -0.691 + 10*log10(mean_ms) : -144;
+
+  sense_on && lufs_st > -70 ? (
+    // error > 0 means we're too quiet -> lower threshold (more limiting/makeup)
+    err = target_lufs - lufs_st;
+    // max threshold move per update, rate-limited to sense_rate_db per second
+    max_step = sense_rate_db * sense_update_every / srate;
+    // proportional step toward target, clamped to the rate limit
+    step = err * sense_gain;
+    step > max_step ? step = max_step : step < -max_step ? step = -max_step;
+    // louder (err>0) needs LOWER threshold, so subtract the (positive) error step
+    new_thresh_db = slider1 - step;
+    new_thresh_db < -30 ? new_thresh_db = -30 : new_thresh_db > 0 ? new_thresh_db = 0;
+    new_thresh_db != slider1 ? (
+      slider1 = new_thresh_db;
+      thresh = 10^(slider1/20);
+      makeup = ceiling / thresh;
+      slider_automate(slider1);
+    );
+  );
+);
+
 // --- gain reduction meter ---
 gain < gr_meter ? gr_meter = gain : ( gr_meter *= gr_meter_decay; gr_meter > 1 ? gr_meter = 1; );
 
 @block
 ext_gr_meter = gr_meter > 0 ? log(gr_meter) * (20/log(10)) : -150;
 
-@gfx 0 32
+@gfx 0 64
 
   gr_meter *= exp(1/30); gr_meter>1?gr_meter=1;
   gfx_r=1; gfx_g=gfx_b=0; gfx_a=0.8;
@@ -233,3 +344,18 @@ ext_gr_meter = gr_meter > 0 ? log(gr_meter) * (20/log(10)) : -150;
   gfx_drawnumber(log10(gr_meter)*20,1);
   gfx_drawchar($'d');
   gfx_drawchar($'B');
+
+  // --- short-term LUFS readout row (below the GR meter) ---
+  lrow_y = meter_h + 4;
+  gfx_a = 1;
+  // short-term LUFS value
+  gfx_x = 4; gfx_y = lrow_y;
+  gfx_r = gfx_g = gfx_b = 1.0;
+  lufs_st > -70 ? gfx_drawnumber(lufs_st, 1) : gfx_drawstr("-inf");
+  gfx_drawstr(" LUFS-S");
+  // target + SENSE status
+  gfx_x = 4; gfx_y = lrow_y + gfx_texth + 2;
+  sense_on ? ( gfx_r = 0.4; gfx_g = 1.0; gfx_b = 0.4; ) : ( gfx_r = gfx_g = gfx_b = 0.6; );
+  gfx_drawstr(sense_on ? "SENSE > " : "target ");
+  gfx_drawnumber(target_lufs, 1);
+  gfx_drawstr(" LUFS");
