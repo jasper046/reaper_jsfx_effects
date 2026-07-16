@@ -3,15 +3,21 @@ desc:Tonal/Noise Splitter
 //author: HPSS tonal/noise splitter
 
 // Splits a stereo signal into a TONAL (harmonic/pitched/sustained) stream and
-// a NOISE (percussive/transient/broadband) stream using median-filter Harmonic-
-// Percussive Source Separation on an STFT.
+// a NOISE & TRANSIENTS (percussive/transient/broadband) stream using median-filter
+// Harmonic-Percussive Source Separation on an STFT.
 //
-//   output 1/2 = tonal  L/R
-//   output 3/4 = noise  L/R   ( = latency-matched input - tonal )
+//   output 1/2 = tonal              L/R
+//   output 3/4 = noise & transients L/R   ( = latency-matched input - tonal )
 //
-// Because the noise stream is the latency-matched input minus the tonal stream,
-// summing all four outputs at unity (e.g. via the Channel Mapper) reconstructs
-// the original signal exactly.
+// Because the noise & transients stream is the latency-matched input minus the
+// tonal stream, summing all four outputs at unity (e.g. via the Channel Mapper)
+// reconstructs the original signal exactly.
+//
+// Onsets/transients land in the noise & transients stream because the harmonic
+// estimate is a trailing time median: at an onset the median lags the sudden
+// energy spike, so the tonal stream only reclaims the pitched content once it has
+// been stable across roughly half the window. Transient Hold sets that window
+// length, shaping how long each onset lingers in the noise & transients stream.
 //
 // The split works on a spectrogram: harmonic energy forms horizontal ridges
 // (stable across time), percussive/noise energy forms vertical ridges (broadband,
@@ -25,11 +31,12 @@ in_pin:left input
 in_pin:right input
 out_pin:tonal output left
 out_pin:tonal output right
-out_pin:noise output left
-out_pin:noise output right
+out_pin:noise & transients output left
+out_pin:noise & transients output right
 
 slider1:split_character=8<0,16,1>Split Character (tonal<->noise)
 slider2:mask_sharpness=2<1,4,0.1>Mask Sharpness
+slider3:transient_hold=2<0,4,1{Short,Med-Short,Medium,Med-Long,Long}>Transient Hold
 
 @init
 
@@ -38,7 +45,7 @@ HOP      = 1024;                 // 4x overlap
 NBINS    = FFT_SIZE/2 + 1;       // real-spectrum bins (incl. DC and Nyquist)
 COLA     = 1.5;                  // Hann^2 overlap sum at 4x overlap
 
-T_MEDIAN = 17;                   // trailing frames for the harmonic (time) median
+T_MEDIAN_MAX = 33;               // largest trailing time-median window (Transient Hold = Long)
 F_MEDIAN = 17;                   // bins for the percussive (frequency) median
 F_HALF   = (F_MEDIAN - 1) / 2;
 
@@ -68,12 +75,13 @@ dly_r      = alloc(BUFLEN);
 fft_l      = alloc(FFT_SIZE * 2);        // interleaved complex work buffers
 fft_r      = alloc(FFT_SIZE * 2);
 
-// Ring of the last T_MEDIAN mid-magnitude spectra for the harmonic (time) median.
-// Mid magnitude = max(|L|,|R|) per bin, so both channels share one mask (linked
-// detector -> stable stereo image).
-magring    = alloc(T_MEDIAN * NBINS);
+// Ring of the last T_MEDIAN_MAX mid-magnitude spectra for the harmonic (time)
+// median. Mid magnitude = max(|L|,|R|) per bin, so both channels share one mask
+// (linked detector -> stable stereo image). The active window t_median <= the ring
+// length is chosen by Transient Hold; the ring is always sized for the maximum.
+magring    = alloc(T_MEDIAN_MAX * NBINS);
 
-tmp_time   = alloc(T_MEDIAN);            // gather across time for one bin
+tmp_time   = alloc(T_MEDIAN_MAX);        // gather across time for one bin
 tmp_freq   = alloc(F_MEDIAN);            // gather across freq for one bin
 harm_buf   = alloc(NBINS);
 perc_buf   = alloc(NBINS);
@@ -104,11 +112,12 @@ function median_n(b, n) local(i, j, key, m) (
 memset(in_l, 0, BUFLEN);  memset(in_r, 0, BUFLEN);
 memset(out_l, 0, BUFLEN); memset(out_r, 0, BUFLEN);
 memset(dly_l, 0, BUFLEN); memset(dly_r, 0, BUFLEN);
-memset(magring, 0, T_MEDIAN * NBINS);
+memset(magring, 0, T_MEDIAN_MAX * NBINS);
 
-bidx    = 0;
-ctr     = 0;
-frames  = 0;
+bidx          = 0;
+ctr           = 0;
+frames        = 0;
+t_median_prev = 0;    // forces the @slider window-change flush on first run
 
 @slider
 
@@ -116,6 +125,24 @@ frames  = 0;
 // 16 = everything leans tonal, 8 = neutral.
 harm_bias  = 2 ^ ((split_character - 8) / 8);   // 0.5 .. 2.0
 mask_power = mask_sharpness;
+
+// Transient Hold -> trailing time-median window (odd frame counts). Longer window
+// = the median lags further behind an onset, so the attack lingers longer in the
+// noise & transients stream before the tonal stream reclaims it.
+t_median =
+  transient_hold < 1 ? 5  :
+  transient_hold < 2 ? 9  :
+  transient_hold < 3 ? 17 :
+  transient_hold < 4 ? 25 : 33;
+
+// Changing the window relayouts the ring modulus, so past frames no longer map to
+// their old slots. Flush the ring and restart frame counting so it repopulates
+// cleanly under the new window rather than reading a scrambled mix.
+t_median != t_median_prev ? (
+  memset(magring, 0, T_MEDIAN_MAX * NBINS);
+  frames = 0;
+  t_median_prev = t_median;
+);
 
 @sample
 
@@ -139,7 +166,7 @@ dly_l[bidx] = spl0; dly_r[bidx] = spl1;
   fft(fft_r, FFT_SIZE); fft_permute(fft_r, FFT_SIZE);
 
   // --- push this frame's mid magnitude into the time-median ring ---
-  head = frames % T_MEDIAN;
+  head = frames % t_median;
   mg = magring + head * NBINS;
   bn = 0;
   loop(NBINS,
@@ -152,15 +179,15 @@ dly_l[bidx] = spl0; dly_r[bidx] = spl1;
   );
   frames += 1;
 
-  // --- harmonic estimate: per-bin median across the T_MEDIAN trailing frames ---
+  // --- harmonic estimate: per-bin median across the t_median trailing frames ---
   bn = 0;
   loop(NBINS,
     k = 0;
-    loop(T_MEDIAN,
+    loop(t_median,
       tmp_time[k] = magring[k * NBINS + bn];
       k += 1;
     );
-    harm_buf[bn] = median_n(tmp_time, T_MEDIAN) * harm_bias;
+    harm_buf[bn] = median_n(tmp_time, t_median) * harm_bias;
     bn += 1;
   );
 
