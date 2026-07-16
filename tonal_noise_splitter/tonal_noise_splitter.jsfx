@@ -36,7 +36,8 @@ out_pin:noise & transients output right
 
 slider1:split_character=8<0,16,1>Split Character (tonal<->noise)
 slider2:mask_sharpness=2<1,4,0.1>Mask Sharpness
-slider3:transient_hold=2<0,4,1{Short,Med-Short,Medium,Med-Long,Long}>Transient Hold
+slider3:transient_hold=9<1,17,1>Transient Hold (short<->long)
+slider4:noise_floor_db=-120<-120,-40,1>Noise Floor (dB)
 
 @init
 
@@ -44,6 +45,10 @@ FFT_SIZE = 4096;
 HOP      = 1024;                 // 4x overlap
 NBINS    = FFT_SIZE/2 + 1;       // real-spectrum bins (incl. DC and Nyquist)
 COLA     = 1.5;                  // Hann^2 overlap sum at 4x overlap
+
+// Bin magnitude of a full-scale sinusoid: amplitude * FFT_SIZE * Hann-coherent-gain
+// (0.5) / 2 (single-sided) = FFT_SIZE/4. Used as 0 dBFS reference for Noise Floor.
+FS_REF   = FFT_SIZE * 0.25;
 
 T_MEDIAN_MAX = 33;               // largest trailing time-median window (Transient Hold = Long)
 F_MEDIAN = 17;                   // bins for the percussive (frequency) median
@@ -126,14 +131,13 @@ t_median_prev = 0;    // forces the @slider window-change flush on first run
 harm_bias  = 2 ^ ((split_character - 8) / 8);   // 0.5 .. 2.0
 mask_power = mask_sharpness;
 
-// Transient Hold -> trailing time-median window (odd frame counts). Longer window
-// = the median lags further behind an onset, so the attack lingers longer in the
-// noise & transients stream before the tonal stream reclaims it.
-t_median =
-  transient_hold < 1 ? 5  :
-  transient_hold < 2 ? 9  :
-  transient_hold < 3 ? 17 :
-  transient_hold < 4 ? 25 : 33;
+// Transient Hold -> trailing time-median window, as an odd frame count. Longer
+// window = the median lags further behind an onset, so the attack lingers longer
+// in the noise & transients stream before the tonal stream reclaims it.
+// Slider 1..17 maps to windows 1,3,..,33; clamp to a real (>=3) median.
+th = min(max(transient_hold|0, 1), 17);
+t_median = 2 * th - 1;
+t_median < 3 ? t_median = 3;
 
 // Changing the window relayouts the ring modulus, so past frames no longer map to
 // their old slots. Flush the ring and restart frame counting so it repopulates
@@ -143,6 +147,11 @@ t_median != t_median_prev ? (
   frames = 0;
   t_median_prev = t_median;
 );
+
+// Noise Floor: absolute bin-magnitude baseline below which a bin is faded fully
+// into the noise & transients stream. -120 dB is treated as off (no floor).
+floor_on  = noise_floor_db > -120;
+floor_mag = FS_REF * pow(10, noise_floor_db / 20);
 
 @sample
 
@@ -213,6 +222,13 @@ dly_l[bidx] = spl0; dly_r[bidx] = spl1;
     hp = pow(harm_buf[bn], mask_power);
     pp = pow(perc_buf[bn], mask_power);
     m = hp / (hp + pp + 0.0000000001);
+    // Below the noise floor, fade the tonal mask toward 0 so faint bins go fully
+    // to the noise & transients stream. Continuous ramp -> no gate zipper; noise
+    // stays exact (= input - tonal) regardless.
+    floor_on ? (
+      atten = cmg[bn] / floor_mag; atten > 1 ? atten = 1;
+      m *= atten;
+    );
     fft_l[bn*2] *= m; fft_l[bn*2+1] *= m;
     fft_r[bn*2] *= m; fft_r[bn*2+1] *= m;
     bn += 1;

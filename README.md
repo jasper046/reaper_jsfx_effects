@@ -9,7 +9,7 @@ folder (or point REAPER at this repo) to use it.
 |---|---|---|
 | [Spectral Dynamics Analyzer](#spectral-dynamics-analyzer) | Analysis | Mid/side spectral dynamics over time |
 | [Hyrax Limiter](#hyrax-limiter) | Dynamics | Smooth brickwall limiter, ported from Matchering |
-| [Tonal/Noise Splitter](#tonalnoise-splitter) | Spectral / routing | Splits a mix into harmonic and percussive/noise streams |
+| [Tonal/Noise Splitter](#tonalnoise-splitter) | Spectral / routing | Splits a mix into a tonal stream and a noise & transients stream |
 
 The [`tools/`](#tools) directory holds a Python simulator for developing and
 validating FFT-based JSFX effects offline.
@@ -119,10 +119,18 @@ This is an approximation, not a bit-exact port. Matchering's attack is zero-phas
 ## Tonal/Noise Splitter
 
 Splits a stereo signal into two streams — a **tonal** stream (harmonic, pitched,
-sustained content) and a **noise** stream (percussive, transient, broadband
-content) — so you can process each independently with any tools you like, then
-recombine. It is the audio equivalent of a mid/side split, but along the
-harmonic-vs-percussive axis instead of the stereo axis.
+sustained content) and a **noise & transients** stream (percussive, transient,
+broadband content) — so you can process each independently with any tools you
+like, then recombine. It is the audio equivalent of a mid/side split, but along
+the harmonic-vs-percussive axis instead of the stereo axis.
+
+Onsets and transients land in the noise & transients stream because the harmonic
+estimate is a *trailing* time median: at an onset the median lags the sudden
+energy spike, so the tonal stream only reclaims the pitched content once it has
+been stable across roughly half the window. This is useful — you can tame
+harshness on the noise & transients stream without dulling the clarity of the
+attacks — and the **Transient Hold** control shapes how long each onset lingers
+there.
 
 ### Routing
 
@@ -131,25 +139,28 @@ The plugin has two inputs and four outputs:
 ```
 in:  L, R
 out: 1/2 = tonal L/R
-     3/4 = noise L/R
+     3/4 = noise & transients L/R
 ```
 
 Put the splitter on a 4-channel track, then process channels 1–2 (tonal) and 3–4
-(noise) however you want — EQ the tonal part with one curve and the noise part
-with another, compress only the noise, brighten only the tonal, and so on.
+(noise & transients) however you want — EQ the tonal part with one curve and the
+noise & transients part with another, compress only the noise, brighten only the
+tonal, and so on.
 
 To recombine, use REAPER's stock **Channel Mapper – Downmixer** (or any summing
-utility) to fold the four channels back to stereo. Because the noise stream is
-formed as `latency-matched input − tonal`, summing all four outputs at unity
-reconstructs the original signal **exactly** (a perfect null), so the split is
-lossless when you are not processing anything.
+utility) to fold the four channels back to stereo. Because the noise & transients
+stream is formed as `latency-matched input − tonal`, summing all four outputs at
+unity reconstructs the original signal **exactly** (a perfect null), so the split
+is lossless when you are not processing anything.
 
 ### Controls
 
 | Slider | Description |
 |---|---|
-| Split Character | Biases the balance between the two streams. 8 is neutral; lower sends more energy to the noise stream, higher sends more to the tonal stream. |
+| Split Character | Biases the balance between the two streams. 8 is neutral; lower sends more energy to the noise & transients stream, higher sends more to the tonal stream. |
 | Mask Sharpness | How hard the decision is between tonal and noise per frequency bin. Higher values separate more aggressively; lower values keep the split softer. |
+| Transient Hold | Length of the trailing time-median window, short → long. Higher holds each onset in the noise & transients stream longer before the tonal stream reclaims it; lower lets onsets rejoin the tonal stream sooner. The midpoint (9) matches the classic behaviour. |
+| Noise Floor (dB) | Absolute magnitude baseline below which a bin is faded fully into the noise & transients stream, keeping low-level hiss out of the tonal part. Calibrated to a full-scale reference; −120 dB is off. The fade is smooth, and reconstruction stays exact. |
 
 ### How it works
 
@@ -159,10 +170,10 @@ ridges (stable in frequency, extended in time) while percussive/noise energy
 forms vertical ridges (broadband, brief). The plugin:
 
 1. Runs a short-time FFT (4096-point, 4× overlap, Hann window).
-2. Estimates the harmonic part with a **median across the last 17 frames** (per bin).
+2. Estimates the harmonic part with a **median across the last N frames** (per bin), where N is set by Transient Hold (5–33 frames).
 3. Estimates the percussive part with a **median across frequency** (per frame).
-4. Builds a soft Wiener-style mask from the ratio of the two and applies it to get the tonal spectrum.
-5. Resynthesizes the tonal stream by inverse FFT and overlap-add, and forms the noise stream by subtracting it from a latency-matched copy of the input.
+4. Builds a soft Wiener-style mask from the ratio of the two, applies Noise Floor to fade sub-threshold bins toward the noise & transients stream, and applies the result to get the tonal spectrum.
+5. Resynthesizes the tonal stream by inverse FFT and overlap-add, and forms the noise & transients stream by subtracting it from a latency-matched copy of the input.
 
 Detection is stereo-linked (both channels share one mask from `max(|L|,|R|)`), so
 the stereo image stays stable. One FFT frame of latency (4096 samples) is reported
