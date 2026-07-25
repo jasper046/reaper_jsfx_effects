@@ -13,7 +13,36 @@ folder (or point REAPER at this repo) to use it.
 | [Delay Isolator](#delay-isolator) | Spectral / restoration | Ducks a wet signal's spectrum wherever a paired dry signal is present, isolating a delay/effects return |
 
 The [`tools/`](#tools) directory holds a Python simulator for developing and
-validating FFT-based JSFX effects offline.
+validating FFT-based JSFX effects offline. The [`templates/`](#templates)
+directory holds example REAPER project templates that wire these effects
+together into ready-to-use setups.
+
+---
+
+## Templates
+
+### `templates/lazy_mastering_template.RPP`
+
+A quick-master setup using the Tonal/Noise Splitter, Hyrax Limiter, and
+[Geraint Luff's Spectrum Matcher](https://geraintluff.github.io/jsfx/#Spectrum%20Matcher)
+(not included in this repo — install it separately; the template's Tonal and
+Noise/Transients tracks each carry an instance of it).
+
+1. Drop your mix onto the **Full Mix** track.
+2. Jump the play cursor to a representative part of the song.
+3. Press play, then hit **Reset** on both Spectrum Matcher instances (Tonal
+   track and Noise/Transients track).
+4. After a couple of seconds of playback, hit **Correct** then **Freeze** on
+   both instances, and adjust to taste.
+5. Set the final level with the **Hyrax Limiter** on the Master track.
+
+### `templates/delay_isolator_template.RPP`
+
+Demonstrates the [Delay Isolator](#delay-isolator) using the dry/wet vocal
+excerpts in [`media/`](#media). The **dry source** and **wet source** tracks
+feed the **delay isolator** track, which splits out to **output delays** (the
+isolated delay/effects content) and **output residual** (what the duck
+removed) so you can hear the split directly.
 
 ---
 
