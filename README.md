@@ -10,6 +10,7 @@ folder (or point REAPER at this repo) to use it.
 | [Spectral Dynamics Analyzer](#spectral-dynamics-analyzer) | Analysis | Mid/side spectral dynamics over time |
 | [Hyrax Limiter](#hyrax-limiter) | Dynamics | Smooth brickwall limiter, ported from Matchering |
 | [Tonal/Noise Splitter](#tonalnoise-splitter) | Spectral / routing | Splits a mix into a tonal stream and a noise & transients stream |
+| [Delay Isolator](#delay-isolator) | Spectral / restoration | Ducks a wet signal's spectrum wherever a paired dry signal is present, isolating a delay/effects return |
 
 The [`tools/`](#tools) directory holds a Python simulator for developing and
 validating FFT-based JSFX effects offline.
@@ -189,6 +190,100 @@ signal (with plugin delay compensation on).
 
 ---
 
+## Delay Isolator
+
+Recovers a delay/effects return from an old mix as a separate track, so it can
+be blended in under a freshly remixed dry vocal. Given the **dry** vocal and the
+**wet** (dry + delay effects) vocal from the old mix, it ducks the wet signal's
+spectrum wherever the dry signal currently has energy, leaving mostly what the
+dry signal didn't already account for — the delay tails, swells, and movement
+that were printed into the old wet track.
+
+This is deliberately **not** deconvolution. An adaptive filter that tries to
+learn a fixed dry→wet mapping only works if that mapping is linear and
+time-invariant; a heavily automated delay send (feedback swells, panning,
+pitch-shifting, filter sweeps) is neither, so no fixed filter converges well on
+it — in testing, an NLMS adaptive-filter approach left obvious artifacts and
+ate into the delay tail. Per-frame spectral ducking has no convergence to fail:
+every frame is ducked independently against the current dry level in that
+band, so it tracks arbitrarily automated sends without trying to model them.
+
+The separation is intentionally imprecise — the goal is to get the delay layer
+"out of the way" of the new dry mix, not a perfect null. Expect to still ride
+the isolated track's volume by hand or cut sections that clash.
+
+### Routing
+
+The plugin has four inputs and four outputs:
+
+```
+in:  1/2 = dry L/R
+     3/4 = wet L/R
+out: 1/2 = isolated delay/effects L/R  ( = wet, ducked wherever dry is present )
+     3/4 = removed L/R                ( = wet - isolated, i.e. what the duck
+                                          took out. isolated + removed = wet
+                                          exactly, so it's useful for
+                                          auditioning how much the duck is
+                                          pulling out at the current settings. )
+```
+
+Route the old dry and wet vocal stems into a 4-channel track (e.g. with
+REAPER's Channel Mapper — Upmixer, or by routing both source tracks to a bus
+with the appropriate channel offsets) feeding this plugin. The plugin declares
+4 out_pins (not 2) even though only channels 1/2 are the useful output in
+normal use — with fewer out_pins than in_pins, REAPER's JSFX host did not
+route the second output channel to the track correctly.
+
+### Controls
+
+| Slider | Description |
+|---|---|
+| Duck Amount (dB) | How aggressively wet is attenuated in bins where dry is present. Higher pulls the direct-sound bleed down harder, at the cost of also thinning the delay tail where it overlaps with new dry energy. |
+| Mask Floor (dB) | Minimum attenuation applied to any bin, so the ducked signal never hits a hard, un-natural null — some delay texture always survives even where dry is momentarily very loud. |
+| Learn Rate (slow↔fast) | How quickly the per-band level-match gain curve adapts. Slower is more stable against a single loud phrase skewing the curve; faster tracks a drifting mix balance more closely. |
+| Hold Level Match | Freezes the level-match curve. Use it to stop adaptation during a passage that's throwing the curve off (e.g. an unusually loud or heavily processed line), then release it once past that section. |
+| Dry Active Threshold (dB) | Absolute level below which the dry signal is treated as silent — the level-match curve stops updating below this, and (with dry at true silence) the mask relaxes toward passthrough, letting the exposed delay tail ring through unducked. |
+
+### How it works
+
+1. Runs a short-time FFT (2048-point, 4× overlap, Hann window) on both the dry
+   and wet inputs.
+2. Maintains a per-frequency-band **level-match gain curve**, learned online as
+   a running average of wet ÷ dry magnitude over frames where dry is active.
+   This corrects for the EQ/compression that typically sits between a dry
+   vocal and its delay send — without it, a single broadband gain assumption
+   leaves the duck aggressiveness wildly inconsistent across the spectrum (and,
+   in testing, across different takes of the same vocal).
+3. Builds a soft Wiener-style mask per bin from wet power vs. level-matched dry
+   power, scaled by Duck Amount and clamped to Mask Floor.
+4. Splits the wet spectrum into `wet * mask` (isolated) and `wet * (1 - mask)`
+   (removed), magnitude only, preserving wet's own phase in both, and
+   resynthesizes each by inverse FFT and overlap-add.
+
+Detection and masking are stereo-linked (both channels share one mask from
+`max(|L|,|R|)`), so the stereo image of the isolated delay stays stable. One
+FFT frame of latency is reported to the host for compensation.
+
+### A note on verification
+
+The framing was validated offline with
+[`tools/jsfx_delay_isolator_sim.py`](#toolsjsfx_delay_isolator_simpy), which
+reproduces the plugin's exact ring-buffer/overlap-add logic and passes the
+impulse test (a wet impulse with dry silent reproduces exactly, since with no
+dry energy the mask is passthrough) and a reconstruction check (isolated +
+removed nulls against wet to better than −300 dB). The ducking behavior itself
+was tuned against real dry/wet vocal stems (checked in under
+[`media/`](#media)) before porting to JSFX — see that script's `--dry`/`--wet`
+mode to reproduce:
+
+```
+python tools/jsfx_delay_isolator_sim.py \
+  --dry media/vocal_a_dry.wav --wet media/vocal_a_wet.wav \
+  --out /tmp/isolated.wav --removed-out /tmp/removed.wav
+```
+
+---
+
 ## Tools
 
 ### `tools/jsfx_stft_sim.py`
@@ -223,6 +318,29 @@ python tools/jsfx_stft_sim.py --wav mix.wav --flat
 ```
 
 Requires `numpy` (and `soundfile` for the `--wav` modes).
+
+### `tools/jsfx_delay_isolator_sim.py`
+
+The same simulator approach applied to the [Delay Isolator](#delay-isolator).
+Since this effect takes two inputs (dry, wet) rather than one, its impulse test
+holds dry silent and feeds wet a single impulse — with no dry energy the duck
+mask is forced to passthrough, so a correct effect still reproduces the
+impulse exactly at the reported latency.
+
+```
+# self-test the framing with an impulse
+python tools/jsfx_delay_isolator_sim.py --impulse
+
+# run the ducking on a real dry/wet pair and write the isolated result
+python tools/jsfx_delay_isolator_sim.py --dry dry.wav --wet wet.wav --out isolated.wav
+```
+
+### `media/`
+
+Short dry/wet vocal excerpts used to develop and validate the Delay Isolator
+against real material (see [its verification note](#a-note-on-verification)).
+`vocal_a`/`vocal_b` are two different takes, each with a `_dry` (no delay
+effects) and `_wet` (delay effects printed in, from an old mix) version.
 
 Framing lessons baked into the tool and the Tonal/Noise Splitter:
 

@@ -1,0 +1,281 @@
+desc:Delay Isolator
+//tags: processing spectral routing
+//author: spectral dry-vocal ducker for isolating a delay/effects return
+
+// Ducks a WET signal's spectrum wherever a paired DRY signal currently has
+// energy, so a delay/effects return recorded from an old mix can be pulled back
+// out and blended under a freshly mixed dry vocal without the two fighting for
+// the same space. This is NOT deconvolution and does not attempt to model or
+// undo the delay itself -- it works even when the delay send was heavily
+// automated (swelling feedback, panning, pitch shift) because there is no fixed
+// filter to converge on; every frame is ducked independently from the current
+// dry level in that band.
+//
+//   in:  1/2 = dry L/R   3/4 = wet L/R
+//   out: 1/2 = isolated delay/effects L/R  ( = wet, ducked wherever dry is present )
+//        3/4 = removed L/R                 ( = wet - isolated, i.e. what the duck
+//                                             took out -- the level-matched dry
+//                                             content the mask suppressed. Useful
+//                                             for auditioning how aggressive the
+//                                             duck is; isolated + removed = wet. )
+//
+// Per bin: mask = |Wet|^2 / (|Wet|^2 + Duck Amount * |Dry_matched|^2), where
+// Dry_matched is the dry spectrum pre-scaled by a per-band gain curve so its
+// average level (over frames where dry is active) matches wet's. Matching per
+// band -- not just broadband -- matters because the original chain typically
+// had EQ/compression between the dry signal and the delay send, so the two
+// have a different spectral balance, not just a different overall level; without
+// this the duck aggressiveness would vary unpredictably across the spectrum.
+//
+// The level-match gain curve is learned continuously online (a slow per-bin
+// running average gated by dry activity), not captured once and frozen, since
+// automated sends drift over the length of a song. LEARN RATE controls how fast
+// it adapts; a HOLD button freezes the curve if adaptation is going wrong in a
+// specific passage (e.g. a rare high-feedback swell skewing the average).
+//
+// One FFT frame of latency is reported for host compensation.
+//
+// Declares 4 out_pins to match the 4 in_pins -- with only 2 out_pins declared
+// against 4 in_pins, REAPER's JSFX host did not route the second real output
+// channel to the track correctly on this build.
+
+in_pin:dry input left
+in_pin:dry input right
+in_pin:wet input left
+in_pin:wet input right
+out_pin:isolated delay/effects left
+out_pin:isolated delay/effects right
+out_pin:removed left
+out_pin:removed right
+
+slider1:duck_db=6<0,24,0.5>Duck Amount (dB)
+slider2:mask_floor_db=-26<-60,0,0.5>Mask Floor (dB)
+slider3:learn_rate=6<1,10,1>Learn Rate (slow<->fast)
+slider4:hold=0<0,1,1>Hold Level Match (freeze learning)
+slider5:dry_active_db=-50<-80,-20,1>Dry Active Threshold (dB)
+
+@init
+
+FFT_SIZE = 2048;
+HOP      = FFT_SIZE / 4;
+NBINS    = FFT_SIZE/2 + 1;
+COLA     = 1.5;
+
+// Bin magnitude of a full-scale sinusoid, used as the 0 dBFS reference for the
+// dry-active threshold (Hann-coherent gain 0.5, single-sided halves it again).
+FS_REF   = FFT_SIZE * 0.25;
+
+latency     = FFT_SIZE;
+pdc_delay   = latency;
+pdc_bot_ch  = 0;
+pdc_top_ch  = 4;
+
+freemem = 0;
+function alloc(n) local(p) ( p = freemem; freemem += n; p; );
+
+win   = alloc(FFT_SIZE);
+
+BUFLEN  = FFT_SIZE * 4;
+in_dl   = alloc(BUFLEN);
+in_dr   = alloc(BUFLEN);
+in_wl   = alloc(BUFLEN);
+in_wr   = alloc(BUFLEN);
+out_l   = alloc(BUFLEN);   // overlap-add accumulator, isolated output
+out_r   = alloc(BUFLEN);
+rem_l   = alloc(BUFLEN);   // overlap-add accumulator, removed (wet - isolated)
+rem_r   = alloc(BUFLEN);
+
+fft_dl  = alloc(FFT_SIZE * 2);
+fft_dr  = alloc(FFT_SIZE * 2);
+fft_wl  = alloc(FFT_SIZE * 2);
+fft_wr  = alloc(FFT_SIZE * 2);
+fft_rl  = alloc(FFT_SIZE * 2);   // removed spectrum, L/R (wet * (1 - mask))
+fft_rr  = alloc(FFT_SIZE * 2);
+
+// Per-bin running averages (dry-active frames only) driving the level-match
+// gain curve, and the smoothed gain curve itself.
+avg_dry  = alloc(NBINS);
+avg_wet  = alloc(NBINS);
+gain_lm  = alloc(NBINS);
+gain_tmp = alloc(NBINS);
+
+function build_window() local(i) (
+  i = 0;
+  loop(FFT_SIZE,
+    win[i] = 0.5 - 0.5*cos(2*$pi*i/FFT_SIZE);
+    i += 1;
+  );
+);
+build_window();
+
+memset(in_dl, 0, BUFLEN); memset(in_dr, 0, BUFLEN);
+memset(in_wl, 0, BUFLEN); memset(in_wr, 0, BUFLEN);
+memset(out_l, 0, BUFLEN); memset(out_r, 0, BUFLEN);
+memset(rem_l, 0, BUFLEN); memset(rem_r, 0, BUFLEN);
+
+i = 0;
+loop(NBINS,
+  avg_dry[i] = 0; avg_wet[i] = 0; gain_lm[i] = 1;
+  i += 1;
+);
+
+bidx   = 0;
+ctr    = 0;
+warm   = 0;     // frame counter, ramps learn-rate up from a fast initial fill
+
+@slider
+
+duck_amount  = pow(10, duck_db / 10);          // power-domain beta
+mask_floor   = pow(10, mask_floor_db / 20);
+active_mag   = FS_REF * pow(10, dry_active_db / 20);
+
+// Learn Rate 1..10 -> EMA coefficient. Slower settings track a long-term average
+// (robust against a single loud phrase skewing the curve); faster settings adapt
+// quickly to a changing mix. Warm-up (first ~40 active frames) always learns fast
+// regardless of the slider so the curve isn't sitting at its silent-start default
+// for the first several seconds of audio.
+alpha = 0.5 ^ (11 - learn_rate);
+
+@sample
+
+in_dl[bidx] = spl0; in_dr[bidx] = spl1;
+in_wl[bidx] = spl2; in_wr[bidx] = spl3;
+
+(ctr += 1) >= HOP ? (
+  ctr = 0;
+
+  bi = bidx - FFT_SIZE;
+  fi = 0;
+  loop(FFT_SIZE,
+    i2 = bi + fi; i2 < 0 ? i2 += BUFLEN;
+    fft_dl[fi*2] = in_dl[i2] * win[fi]; fft_dl[fi*2+1] = 0;
+    fft_dr[fi*2] = in_dr[i2] * win[fi]; fft_dr[fi*2+1] = 0;
+    fft_wl[fi*2] = in_wl[i2] * win[fi]; fft_wl[fi*2+1] = 0;
+    fft_wr[fi*2] = in_wr[i2] * win[fi]; fft_wr[fi*2+1] = 0;
+    fi += 1;
+  );
+
+  fft(fft_dl, FFT_SIZE); fft_permute(fft_dl, FFT_SIZE);
+  fft(fft_dr, FFT_SIZE); fft_permute(fft_dr, FFT_SIZE);
+  fft(fft_wl, FFT_SIZE); fft_permute(fft_wl, FFT_SIZE);
+  fft(fft_wr, FFT_SIZE); fft_permute(fft_wr, FFT_SIZE);
+
+  // --- dry mid magnitude per bin (stereo-linked, stable image), stashed for the
+  //     level-match update below, plus total energy for the dry-active gate ---
+  frame_energy = 0;
+  bn = 0;
+  loop(NBINS,
+    rdl = fft_dl[bn*2]; idl = fft_dl[bn*2+1];
+    rdr = fft_dr[bn*2]; idr = fft_dr[bn*2+1];
+
+    md = max(sqrt(rdl*rdl + idl*idl), sqrt(rdr*rdr + idr*idr));
+
+    gain_tmp[bn] = md;
+    frame_energy += md*md;
+    bn += 1;
+  );
+
+  dry_active = frame_energy > (active_mag * active_mag * 0.1);
+
+  // --- update the per-bin level-match running averages, dry-active frames only ---
+  (dry_active && !hold) ? (
+    a = warm < 40 ? 0.3 : alpha;
+    bn = 0;
+    loop(NBINS,
+      rwl = fft_wl[bn*2]; iwl = fft_wl[bn*2+1];
+      rwr = fft_wr[bn*2]; iwr = fft_wr[bn*2+1];
+      mw = max(sqrt(rwl*rwl + iwl*iwl), sqrt(rwr*rwr + iwr*iwr));
+
+      avg_dry[bn] = (1-a)*avg_dry[bn] + a*gain_tmp[bn];
+      avg_wet[bn] = (1-a)*avg_wet[bn] + a*mw;
+      bn += 1;
+    );
+    warm += 1;
+
+    // smooth the resulting gain curve across neighboring bins (light 5-bin
+    // average) so it doesn't overfit to per-bin noise in the running averages
+    bn = 0;
+    loop(NBINS,
+      j = -2; sum = 0; cnt = 0;
+      loop(5,
+        idx = bn + j;
+        (idx >= 0 && idx < NBINS) ? (
+          sum += (avg_wet[idx] + 0.0000000001) / (avg_dry[idx] + 0.0000000001);
+          cnt += 1;
+        );
+        j += 1;
+      );
+      gain_lm[bn] = sqrt(sum / cnt);
+      bn += 1;
+    );
+  );
+
+  // --- duck mask: wet vs level-matched dry. Split wet into the isolated
+  //     spectrum (wet * m) and the removed spectrum (wet * (1-m)) so
+  //     isolated + removed reconstructs wet exactly. ---
+  bn = 0;
+  loop(NBINS,
+    rdl = fft_dl[bn*2]; idl = fft_dl[bn*2+1];
+    rdr = fft_dr[bn*2]; idr = fft_dr[bn*2+1];
+    rwl = fft_wl[bn*2]; iwl = fft_wl[bn*2+1];
+    rwr = fft_wr[bn*2]; iwr = fft_wr[bn*2+1];
+
+    md = max(sqrt(rdl*rdl + idl*idl), sqrt(rdr*rdr + idr*idr));
+    mw = max(sqrt(rwl*rwl + iwl*iwl), sqrt(rwr*rwr + iwr*iwr));
+
+    dry_matched = md * gain_lm[bn];
+
+    wp = mw*mw;
+    dp = dry_matched*dry_matched;
+    m = wp / (wp + duck_amount*dp + 0.0000000001);
+    m < mask_floor ? m = mask_floor;
+    m > 1 ? m = 1;
+
+    fft_rl[bn*2] = rwl * (1-m); fft_rl[bn*2+1] = iwl * (1-m);
+    fft_rr[bn*2] = rwr * (1-m); fft_rr[bn*2+1] = iwr * (1-m);
+
+    fft_wl[bn*2] *= m; fft_wl[bn*2+1] *= m;
+    fft_wr[bn*2] *= m; fft_wr[bn*2+1] *= m;
+    bn += 1;
+  );
+
+  // --- mirror conjugate half, inverse FFT ---
+  bn = 1;
+  loop(FFT_SIZE/2 - 1,
+    dst = FFT_SIZE - bn;
+    fft_wl[dst*2] = fft_wl[bn*2]; fft_wl[dst*2+1] = -fft_wl[bn*2+1];
+    fft_wr[dst*2] = fft_wr[bn*2]; fft_wr[dst*2+1] = -fft_wr[bn*2+1];
+    fft_rl[dst*2] = fft_rl[bn*2]; fft_rl[dst*2+1] = -fft_rl[bn*2+1];
+    fft_rr[dst*2] = fft_rr[bn*2]; fft_rr[dst*2+1] = -fft_rr[bn*2+1];
+    bn += 1;
+  );
+
+  fft_ipermute(fft_wl, FFT_SIZE); ifft(fft_wl, FFT_SIZE);
+  fft_ipermute(fft_wr, FFT_SIZE); ifft(fft_wr, FFT_SIZE);
+  fft_ipermute(fft_rl, FFT_SIZE); ifft(fft_rl, FFT_SIZE);
+  fft_ipermute(fft_rr, FFT_SIZE); ifft(fft_rr, FFT_SIZE);
+
+  // --- overlap-add forward from FFT_SIZE samples back ---
+  fi = 0;
+  loop(FFT_SIZE,
+    i2 = bi + fi; i2 < 0 ? i2 += BUFLEN;
+    g = win[fi] / (COLA * FFT_SIZE);
+    out_l[i2] += fft_wl[fi*2] * g;
+    out_r[i2] += fft_wr[fi*2] * g;
+    rem_l[i2] += fft_rl[fi*2] * g;
+    rem_r[i2] += fft_rr[fi*2] * g;
+    fi += 1;
+  );
+);
+
+op = bidx - latency; op < 0 ? op += BUFLEN;
+
+spl0 = out_l[op];
+spl1 = out_r[op];
+spl2 = rem_l[op];
+spl3 = rem_r[op];
+
+out_l[op] = 0; out_r[op] = 0;
+rem_l[op] = 0; rem_r[op] = 0;
+
+(bidx += 1) >= BUFLEN ? bidx = 0;
