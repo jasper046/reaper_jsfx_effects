@@ -29,6 +29,7 @@ function alloc(n) local(i) ( i = mem; mem += n; i; );
 fftwork  = alloc(8192);    // FFT_SIZE * 2 (complex pairs via fft_real)
 win_buf  = alloc(2049);    // FFT_SIZE * 0.5 + 1
 fft_tmp  = alloc(MAX_BINS);  // scratch for smoothing pass
+fft_cnt  = alloc(MAX_BINS);  // FFT bins summed into each band, for the mean
 
 bin_freq = alloc(MAX_BINS);
 mid_peak = alloc(MAX_BINS);
@@ -160,11 +161,12 @@ function build_window() local(i, dp, wp, pwr) (
 );
 
 // ── FFT + per-bin envelope update ─────────────────────────────────────────
-// Bins are 1/3-octave: bin = floor(3 * log(freq) / log(2))
-// After accumulating raw per-bin magnitudes into fft_tmp, a 3-bin
-// moving average smooths across neighbouring bands before updating envelopes.
+// Bins are 1/3-octave: bin = floor(3 * log(freq) / log(2)), each holding the
+// mean power of the FFT bins that fall inside it. Below ~700 Hz a 1/3-oct band
+// is narrower than the FFT resolution, so those bands hold a single bin and the
+// display is FFT-limited there — the price of a 4096-point transform.
 function run_fft(hist, hpos, hend, peak_buf, avg_buf, min_buf, write_freq)
-  local(b1, b2, b3, i, mag, freq, bin, last_bin, nb, rof, sm)
+  local(b1, b2, b3, i, mag, freq, bin, last_bin, nb, rof)
 (
   b1 = hpos - FFT_SIZE;
   b1 < hist ? b1 += hend - hist;
@@ -193,32 +195,38 @@ function run_fft(hist, hpos, hend, peak_buf, avg_buf, min_buf, write_freq)
 
   // accumulate FFT magnitudes into 1/3-oct bins in fft_tmp
   memset(fft_tmp, 0, MAX_BINS);
+  memset(fft_cnt, 0, MAX_BINS);
   loop(FFT_SIZE * 0.5,
     freq = i * rof;
-    bin  = floor(9 * log(freq) / LOG2);
+    bin  = floor(3 * log(freq) / LOG2);
     mag  = sqr(fftwork[i*2]) + sqr(fftwork[i*2+1]);
 
     bin != last_bin ? (
       nb += 1;
       last_bin = bin;
       fft_tmp[nb] = mag;
-      write_freq ? bin_freq[nb] = freq;
+      fft_cnt[nb] = 1;
+      // Label the band by its nominal 1/3-oct centre, not the frequency of the
+      // first FFT bin that happened to land in it.
+      write_freq ? bin_freq[nb] = pow(2, (bin + 0.5) / 3);
     ) : (
-      fft_tmp[nb] = max(fft_tmp[nb], mag);
+      fft_tmp[nb] += mag;
+      fft_cnt[nb] += 1;
     );
     i += 1;
   );
   nb += 1;  // nb is now bin count
 
-  // 3-bin moving average smoothing pass on fft_tmp
-  i = 1;
-  loop(nb - 2,
-    sm = (fft_tmp[i-1] + fft_tmp[i] + fft_tmp[i+1]) / 3;
-    fft_tmp[i] = sm;
+  // Mean power per band. Summing alone would tilt the curve upward with
+  // frequency, since a 1/3-oct band spans proportionally more FFT bins the
+  // higher it sits; dividing by the count makes bands directly comparable.
+  i = 0;
+  loop(nb,
+    fft_cnt[i] > 0 ? fft_tmp[i] /= fft_cnt[i];
     i += 1;
   );
 
-  // update envelopes from smoothed bins
+  // update envelopes
   i = 0;
   loop(nb,
     mag = fft_tmp[i];
