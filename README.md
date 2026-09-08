@@ -1,4 +1,4 @@
-# reaper_js_effects
+# reaper_jsfx_effects
 
 Custom [JSFX](https://www.reaper.fm/sdk/js/js.php) plugins for REAPER, focused on
 mastering: analysis, limiting, and spectral processing. Each effect lives in its
