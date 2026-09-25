@@ -18,6 +18,7 @@ slider5:100<0,100,1>Stereo Link (%)
 slider6:1<0,1,1{Off,On}>True Peak Detection
 slider7:-14<-30,-5,0.1>Target LUFS (short-term)
 slider8:0<0,1,1{Off,On}>SENSE (auto threshold)
+slider9:0<0,1,1{Off,On}>HF Slew Smoothing
 
 in_pin:left input
 in_pin:right input
@@ -63,6 +64,12 @@ hold_ctr = 0;
 
 gr_meter = 1;
 gr_meter_decay = exp(1/(1*srate));
+
+// HF slew smoothing (fixed final stage; slider9). SVF low-pass state and the
+// recursive slew-limiter output state, per channel. See @slider for the fixed
+// defaults and vinyl_filter.h (flat_slew) in the web/auto-mastering codebase.
+sl_ic1L = sl_ic2L = sl_ic1R = sl_ic2R = 0;
+sl_prevL = sl_prevR = 0;
 
 last_cap = 0;              // mouse button edge-detection for UI buttons
 
@@ -157,6 +164,19 @@ link = slider5 * 0.01;
 truepeak = slider6;
 target_lufs = slider7;
 sense_on = slider8;
+hf_slew_on = slider9;
+
+// HF slew smoothing: fixed defaults, not tunable -- the trademark HF finish.
+// Crossover 3 kHz (high band = x - LP(x)); Smax = a full-scale 1 kHz sine's
+// per-sample slew (0 dB rel, ~ the p99.9 the offline stage settles on for a
+// ceiling-normalized master); soft knee 0.3. SVF low-pass Q = 1/sqrt(2).
+sl_ref  = 2*$pi*1000/srate;
+sl_smax = sl_ref;
+sl_kabs = 0.3 * sl_smax;
+sl_thr  = sl_smax - sl_kabs;
+sl_fc   = min(3000, 0.45*srate);
+sl_g = tan($pi*sl_fc/srate); sl_k = 1/0.7071067811865476;
+sl_a1 = 1/(1 + sl_g*(sl_g+sl_k)); sl_a2 = sl_g*sl_a1; sl_a3 = sl_g*sl_a2;
 
 // Sliding-max hold window length (samples)
 hold_samples = max(1, floor(HOLD_MS * 0.001 * srate));
@@ -272,6 +292,34 @@ spl1 = buf1[rpos] * gr * makeup;
 
 (wpos += 1) >= LA_MAX ? wpos = 0;
 
+// --- HF slew smoothing (fixed final stage, slider9) ---
+// Caps the per-sample slew of the high band with a soft knee -- a hint of HF
+// smoothness on the delivered master, run last so the LUFS meter and SENSE see
+// the final signal. Fixed defaults (see @slider); zero added latency.
+hf_slew_on ? (
+  slv3 = spl0 - sl_ic2L; slv1 = sl_a1*sl_ic1L + sl_a2*slv3; slv2 = sl_ic2L + sl_a2*sl_ic1L + sl_a3*slv3;
+  sl_ic1L = 2*slv1 - sl_ic1L; sl_ic2L = 2*slv2 - sl_ic2L;
+  sllo = slv2; slhi = spl0 - sllo;
+  sld = slhi - sl_prevL; slad = abs(sld);
+  slad > sl_thr ? (
+    slover = slad - sl_thr;
+    slmag = slover >= 2*sl_kabs ? sl_smax : sl_thr + slover - slover*slover/(4*sl_kabs);
+    sld = sld > 0 ? slmag : -slmag;
+  );
+  sl_prevL += sld; spl0 = sllo + sl_prevL;
+
+  slv3 = spl1 - sl_ic2R; slv1 = sl_a1*sl_ic1R + sl_a2*slv3; slv2 = sl_ic2R + sl_a2*sl_ic1R + sl_a3*slv3;
+  sl_ic1R = 2*slv1 - sl_ic1R; sl_ic2R = 2*slv2 - sl_ic2R;
+  sllo = slv2; slhi = spl1 - sllo;
+  sld = slhi - sl_prevR; slad = abs(sld);
+  slad > sl_thr ? (
+    slover = slad - sl_thr;
+    slmag = slover >= 2*sl_kabs ? sl_smax : sl_thr + slover - slover*slover/(4*sl_kabs);
+    sld = sld > 0 ? slmag : -slmag;
+  );
+  sl_prevR += sld; spl1 = sllo + sl_prevR;
+);
+
 // --- short-term LUFS measurement on the output (BS.1770 K-weighting) ---
 // Each channel through its own K-weighting biquad pair; sum the per-channel
 // mean-squares (channel weight 1.0 for L/R) as the standard specifies.
@@ -327,7 +375,7 @@ gain < gr_meter ? gr_meter = gain : ( gr_meter *= gr_meter_decay; gr_meter > 1 ?
 @block
 ext_gr_meter = gr_meter > 0 ? log(gr_meter) * (20/log(10)) : -150;
 
-@gfx 420 150
+@gfx 420 195
 
   // decay the GR meter here too so it releases when audio stops
   gr_meter *= exp(1/30); gr_meter>1?gr_meter=1;
@@ -382,12 +430,15 @@ ext_gr_meter = gr_meter > 0 ? log(gr_meter) * (20/log(10)) : -150;
 
   // ================= buttons (right side) =================
   bw = 120; bh = 34; bx = gfx_w - pad - bw;
-  tp_y = l_y; sn_y = l_y + bh + 10;
+  tp_y = l_y; sn_y = l_y + bh + 10; hs_y = l_y + 2*(bh + 10);
   btn(bx, tp_y, bw, bh, truepeak, "TRUE PEAK") ? (
     slider6 = truepeak = !truepeak; slider_automate(slider6);
   );
   btn(bx, sn_y, bw, bh, sense_on, "SENSE") ? (
     slider8 = sense_on = !sense_on; slider_automate(slider8);
+  );
+  btn(bx, hs_y, bw, bh, hf_slew_on, "HF SLEW") ? (
+    slider9 = hf_slew_on = !hf_slew_on; slider_automate(slider9);
   );
 
   last_cap = mouse_cap;

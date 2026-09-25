@@ -9,6 +9,7 @@ folder (or point REAPER at this repo) to use it.
 |---|---|---|
 | [Spectral Dynamics Analyzer](#spectral-dynamics-analyzer) | Analysis | Mid/side spectral dynamics over time |
 | [Hyrax Limiter](#hyrax-limiter) | Dynamics | Smooth brickwall limiter, ported from Matchering |
+| [HF Slew Limiter](#hf-slew-limiter) | Dynamics / smoothing | Content-adaptive high-frequency slew-rate limiter for a hint of top-end smoothness |
 | [Tonal/Noise Splitter](#tonalnoise-splitter) | Spectral / routing | Splits a mix into a tonal stream and a noise & transients stream |
 | [Delay Isolator](#delay-isolator) | Spectral / restoration | Ducks a wet signal's spectrum wherever a paired dry signal is present, isolating a delay/effects return |
 
@@ -121,6 +122,7 @@ insert, with the host compensating for the look-ahead latency.
 | True Peak Detection | When on, estimates inter-sample peaks in the detection sidechain to reduce overshoots. This is a linear-interpolation estimate, not a certified true-peak ceiling. |
 | Target LUFS (short-term) | The loudness target for the SENSE loop (short-term, 3 s). |
 | SENSE (auto threshold) | When on, slowly rides the Threshold to bring the output's short-term LUFS toward the target. When off, the Threshold is frozen at its current value and manually adjustable again. |
+| HF Slew Smoothing | When on, appends a fixed high-frequency slew-rate limiter as the final stage — a hint of top-end smoothness on the delivered master. Default settings only, not tunable (crossover 3 kHz, cap ≈ a full-scale 1 kHz sine's per-sample slew, soft knee 0.3). For a tunable version use the standalone [HF Slew Limiter](#hf-slew-limiter). |
 
 ### LUFS metering and SENSE
 
@@ -128,7 +130,7 @@ The plugin measures its **output** loudness as short-term LUFS (BS.1770 K-weight
 
 ### Interface
 
-The graphical panel shows a horizontal **gain-reduction meter** (full scale −6 dB, since a mastering-grade limiter rarely needs to pull more than ~3 dB), the **output short-term LUFS** as a large number with the target beneath it, and clickable **TRUE PEAK** and **SENSE** buttons (these mirror their sliders, so host automation and preset recall still work).
+The graphical panel shows a horizontal **gain-reduction meter** (full scale −6 dB, since a mastering-grade limiter rarely needs to pull more than ~3 dB), the **output short-term LUFS** as a large number with the target beneath it, and clickable **TRUE PEAK**, **SENSE**, and **HF SLEW** buttons (these mirror their sliders, so host automation and preset recall still work).
 
 ### How it works
 
@@ -143,6 +145,52 @@ Peak detection uses a sliding maximum over the look-ahead window. The audio path
 ### Fidelity notes
 
 This is an approximation, not a bit-exact port. Matchering's attack is zero-phase (it looks both forward and backward in time), which a causal plugin cannot reproduce; the look-ahead delay approximates it. For bit-exact Matchering output, run audio through Matchering offline. The true-peak option underestimates real inter-sample peaks and should not be relied on for a hard true-peak delivery spec.
+
+---
+
+## HF Slew Limiter
+
+A content-adaptive **high-frequency slew-rate limiter** for a hint of top-end
+smoothness. Harshness in a master is, physically, a matter of slew rate — a sharp
+high-frequency transient is a large per-sample change (first difference). This
+effect caps only the very sharpest of those changes on the high band, so it
+de-stresses the top end without dulling the body of the sound, whose slew sits
+well below the cap. It is the real-time, tunable counterpart of the "flat slew"
+smoothness stage in our offline auto-mastering engine, and the same idea the
+[Hyrax Limiter](#hyrax-limiter)'s **HF Slew Smoothing** option applies with fixed
+defaults.
+
+### Controls
+
+| Slider | Description |
+|---|---|
+| Amount (percentile) | How much to smooth, as a percentile of the high band's own per-sample slew: the cap is set so the sharpest `(100 − Amount)%` of transitions are limited. **Lower = more aggressive** — 99.9 is a subtle mastering finish (0.1% clamped), 99.0 is firm, and the low end of the range (down to 80 = 20% clamped) is heavy, creative smoothing. The cap is derived from the material, so one setting works across tracks of different levels. The subtle zone is a thin slice of the slider's travel, so type exact values into the edit box for fine settings near the top. |
+| Crossover (Hz) | Split frequency for the high band (`high = x − lowpass(x)`). Only content above this is affected. |
+| Knee | Soft-knee width as a fraction of the cap, so the limit is approached gradually rather than as a hard clamp (which would add its own harmonics). |
+| Window (s) | Look-ahead window the cap is measured over. Longer adapts more slowly and steadily; this is reported to the host as latency. |
+| Mix (%) | Dry/wet blend of the smoothed result. |
+
+### How it works
+
+Per channel: the signal is split into a low band (a 2nd-order state-variable
+low-pass) and its complement high band. Over a look-ahead window the effect keeps
+a histogram of the high band's `|slew|` and reads off the **Amount** percentile as
+the cap `Smax`; a slowly-moving, level-adaptive threshold. The high band is then
+passed through a recursive soft-knee slew limiter (the output's slew is what is
+bounded), recombined with the low band, and blended per **Mix**. The cap is
+expressed relative to a full-scale 1 kHz sine's per-sample slew, so it is
+sample-rate independent.
+
+Because the cap is a look-ahead percentile, the effect reports **Window** seconds
+of latency to the host — fine for mixing and mastering, not for live monitoring.
+
+### Fidelity notes
+
+The offline auto-mastering stage sets its cap from a single percentile over the
+whole file; this uses a sliding look-ahead window instead, so on strongly varying
+material the cap tracks the local content rather than one global value. For steady
+program the two converge. The limiting itself (soft-knee recursive slew clamp on
+the phase-coherent high band) matches the offline algorithm.
 
 ---
 

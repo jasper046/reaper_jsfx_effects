@@ -1,0 +1,225 @@
+desc:HF Slew Limiter
+//tags: dynamics mastering de-ess smoothing
+//author: cotg
+
+// Content-adaptive high-frequency slew-rate limiter. Caps the per-sample slew
+// (the first difference) of the high band, which is the physical "harshness"
+// dimension: a sharp HF transient is a high slew rate. Clamping only the very
+// sharpest slews de-stresses the top end -- a hint of smoothness -- while the
+// body of the sound, whose slew is well below the cap, passes untouched.
+//
+// The cap Smax is set automatically from the material, reproducing the offline
+// auto-mastering "flat slew" stage: over a look-ahead window it takes the Amount
+// percentile of the high band's own |slew|, so the sharpest (100 - Amount)% of
+// transitions are limited. A single Amount setting therefore works across tracks
+// of different levels -- no manual threshold to dial. Lower Amount = more
+// aggressive: 99.9 is a subtle mastering finish (0.1% clamped), while the low end
+// of the range (down to 80 = 20% clamped) is heavy, creative smoothing. Because
+// the subtle zone is a thin slice of the slider's travel, type exact values into
+// the control's edit box for fine settings near the top.
+//
+// Signal path, per channel:
+//   low  = LP(x, Crossover)          -- 2nd-order (12 dB/oct) SVF low-pass
+//   high = x - low                   -- phase-coherent high band
+//   Smax = percentile(|d(high)|, Amount) over the look-ahead window
+//   high'= soft_slew_limit(high, Smax, Knee)   -- recursive, soft quadratic knee
+//   out  = low + high'               -- recombine
+//   y    = dry + Mix*(out - dry)     -- dry/wet
+//
+// The window is look-ahead: the limiter reads audio delayed by Window seconds,
+// by which point the window of slews starting at that sample has been seen. That
+// latency is reported to the host for compensation (fine for mixing/mastering;
+// not for live monitoring).
+
+slider1:99.9<80,99.99,0.01>Amount (percentile)
+slider2:3000<500,12000,10>Crossover (Hz)
+slider3:0.30<0,1,0.01>Knee
+slider4:2.0<0.25,5,0.05>Window (s)
+slider5:100<0,100,1>Mix (%)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+
+// --- slew-magnitude histogram, in dB relative to a full-scale 1 kHz sine's
+// per-sample slew (ref = 2*pi*1000/srate). Same unit as the C++ engine, so the
+// limit is sample-rate independent. Bins span DB_LO..DB_HI at BINW resolution.
+DB_LO = -80; DB_HI = 24; BINW = 0.5;
+NB = floor((DB_HI - DB_LO) / BINW);   // 208 bins
+
+// Ring buffers sized for the maximum window (5 s). The delay line and the
+// per-slot slew bin share this length; two histograms (L/R) sit after them.
+N_MAX = ceil(5 * srate) + 8;
+lowL  = 0;
+lowR  = lowL  + N_MAX;
+highL = lowR  + N_MAX;
+highR = highL + N_MAX;
+sbinL = highR + N_MAX;   // per-written-sample slew bin, for O(1) histogram removal
+sbinR = sbinL + N_MAX;
+histL = sbinR + N_MAX;
+histR = histL + NB;
+freemem = histR + NB;
+
+// SVF (Andrew Simper TPT) low-pass state, per channel, run on the input.
+ic1L = ic2L = ic1R = ic2R = 0;
+pw_hL = pw_hR = 0;        // previous written high sample (for the slew difference)
+
+wpos = 0;                 // ring write position
+fill = 0;                 // priming counter until the window is full
+cntL = cntR = 0;          // live sample count in each histogram
+prevL = prevR = 0;        // recursive slew-limiter output state
+smaxL = smaxR = 1000000000;      // current cap per channel (huge = off until primed)
+W = 0;                    // current window length (samples); set in @slider
+
+// Percentile of a histogram: smallest bin whose cumulative count reaches
+// target = Amount% of the total, converted from bin-centre dB back to a linear
+// slew. Returns a huge value (limiter off) until there is data.
+function calc_smax(hist, cnt) local(target, acc, b, smdb) (
+  cnt < 1 ? ( 1000000000 ) : (
+    target = pct * 0.01 * cnt;
+    b = 0; acc = hist[0];
+    while (acc < target && b < NB - 1) ( b += 1; acc += hist[b]; );
+    smdb = DB_LO + (b + 0.5) * BINW;
+    ref * 10^(smdb / 20);
+  );
+);
+
+// Map a linear slew magnitude to a histogram bin index (clamped).
+function slew_bin(s) local(t) (
+  s <= 0 ? 0 : (
+    t = (20*log10(s / ref) - DB_LO) / BINW;
+    t < 0 ? 0 : t > NB - 1 ? NB - 1 : floor(t);
+  );
+);
+
+@slider
+
+pct       = slider1;
+fc        = min(slider2, 0.45 * srate);   // keep the LP below Nyquist
+knee_frac = slider3;
+mix       = slider5 * 0.01;
+
+ref = 2 * $pi * 1000 / srate;
+
+// SVF low-pass coefficients (Butterworth Q = 1/sqrt(2)).
+g  = tan($pi * fc / srate);
+kk = 1 / 0.7071067811865476;
+a1 = 1 / (1 + g*(g + kk));
+a2 = g * a1;
+a3 = g * a2;
+
+// Window length; a change re-primes the look-ahead buffers and histograms so a
+// stale window cannot bias the percentile.
+newW = min(max(floor(slider4 * srate), 1), N_MAX - 1);
+newW != W ? (
+  W = newW;
+  memset(histL, 0, NB); memset(histR, 0, NB);
+  cntL = cntR = 0; fill = 0; wpos = 0;
+  pw_hL = pw_hR = 0; prevL = prevR = 0;
+  smaxL = smaxR = 1000000000;
+);
+
+// Report look-ahead latency for host time-alignment.
+pdc_delay = W;
+pdc_bot_ch = 0;
+pdc_top_ch = 2;
+
+@block
+
+// Recompute the caps once per block: the window is long and Smax moves slowly,
+// so a per-sample percentile scan would be wasted work.
+smaxL = calc_smax(histL, cntL);
+smaxR = calc_smax(histR, cntR);
+
+@sample
+
+// --- WRITE: split the incoming sample into low/high and bin its slew ---
+v3 = spl0 - ic2L; v1 = a1*ic1L + a2*v3; v2 = ic2L + a2*ic1L + a3*v3;
+ic1L = 2*v1 - ic1L; ic2L = 2*v2 - ic2L;
+loL = v2; hiL = spl0 - loL;
+
+v3 = spl1 - ic2R; v1 = a1*ic1R + a2*v3; v2 = ic2R + a2*ic1R + a3*v3;
+ic1R = 2*v1 - ic1R; ic2R = 2*v2 - ic2R;
+loR = v2; hiR = spl1 - loR;
+
+bL = slew_bin(abs(hiL - pw_hL)); pw_hL = hiL;
+bR = slew_bin(abs(hiR - pw_hR)); pw_hR = hiR;
+
+histL[bL] += 1; cntL += 1;
+histR[bR] += 1; cntR += 1;
+
+lowL[wpos] = loL; highL[wpos] = hiL; sbinL[wpos] = bL;
+lowR[wpos] = loR; highR[wpos] = hiR; sbinR[wpos] = bR;
+
+// --- READ: once the window is full, output the delayed sample, limited ---
+fill >= W ? (
+  rpos = wpos - W; rpos < 0 ? rpos += N_MAX;
+
+  // The output sample is no longer "ahead", so drop it from the histogram;
+  // what remains is exactly the look-ahead window [rpos+1 .. wpos].
+  histL[sbinL[rpos]] -= 1; cntL -= 1;
+  histR[sbinR[rpos]] -= 1; cntR -= 1;
+
+  // Soft-knee recursive slew limit on the high band, left channel.
+  kabs = knee_frac * smaxL; thr = smaxL - kabs;
+  d = highL[rpos] - prevL; ad = abs(d);
+  ad > thr ? (
+    over = ad - thr;
+    kabs > 0 ? ( mag = over >= 2*kabs ? smaxL : thr + over - over*over/(4*kabs); ) : ( mag = smaxL; );
+    d = d > 0 ? mag : -mag;
+  );
+  prevL += d;
+  dryL = lowL[rpos] + highL[rpos];
+  wetL = lowL[rpos] + prevL;
+  spl0 = dryL + mix * (wetL - dryL);
+
+  // Right channel.
+  kabs = knee_frac * smaxR; thr = smaxR - kabs;
+  d = highR[rpos] - prevR; ad = abs(d);
+  ad > thr ? (
+    over = ad - thr;
+    kabs > 0 ? ( mag = over >= 2*kabs ? smaxR : thr + over - over*over/(4*kabs); ) : ( mag = smaxR; );
+    d = d > 0 ? mag : -mag;
+  );
+  prevR += d;
+  dryR = lowR[rpos] + highR[rpos];
+  wetR = lowR[rpos] + prevR;
+  spl1 = dryR + mix * (wetR - dryR);
+) : (
+  // Priming the look-ahead: output silence (the host compensates the latency).
+  spl0 = 0; spl1 = 0;
+  fill += 1;
+);
+
+(wpos += 1) >= N_MAX ? wpos = 0;
+
+@gfx 360 120
+
+  gfx_clear = 0;
+  pad = 12;
+  gfx_setfont(0);
+
+  gfx_r = gfx_g = gfx_b = 0.7; gfx_a = 1;
+  gfx_x = pad; gfx_y = pad;
+  gfx_drawstr("HF Slew Limiter");
+
+  // Live caps, in dB relative to the 1 kHz full-scale slew reference.
+  smL_db = smaxL < 100000000 ? 20*log10(smaxL / ref) : 1000000000;
+  smR_db = smaxR < 100000000 ? 20*log10(smaxR / ref) : 1000000000;
+
+  gfx_r = gfx_g = gfx_b = 0.55;
+  gfx_x = pad; gfx_y = pad + 24;
+  gfx_drawstr("Smax L ");
+  smL_db < 100000000 ? ( gfx_drawnumber(smL_db, 1); gfx_drawstr(" dB") ) : gfx_drawstr("--");
+  gfx_x = pad; gfx_y = pad + 42;
+  gfx_drawstr("Smax R ");
+  smR_db < 100000000 ? ( gfx_drawnumber(smR_db, 1); gfx_drawstr(" dB") ) : gfx_drawstr("--");
+
+  gfx_r = gfx_g = gfx_b = 0.45;
+  gfx_x = pad; gfx_y = pad + 66;
+  gfx_drawstr("Amount "); gfx_drawnumber(pct, 2);
+  gfx_x = pad; gfx_y = pad + 84;
+  gfx_drawstr("Window "); gfx_drawnumber(W / srate, 2); gfx_drawstr(" s  (latency)");
